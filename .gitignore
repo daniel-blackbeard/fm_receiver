@@ -1,0 +1,36 @@
+# Build/run artifacts (all Vivado outputs land here)
+output/
+
+# Bare-metal software build output (sw/startup.S, sw/main.c -> sw/build/*.elf)
+sw/build/
+
+# Vivado project-level cruft that can appear outside output/
+.Xil/
+*.jou
+*.log
+*.str
+*.backup.jou
+*.pb
+webtalk*.jou
+webtalk*.log
+usage_statistics_webtalk.html
+.Rerun_*
+*.zip
+
+# JVM crash dumps Vivado sometimes leaves behind
+hs_err_pid*.log
+hs_err_pid*.dmp
+
+# Internal-only material: debugging notes, vendor reference docs, scratch/
+# test firmware, one-off diagnostic scripts. Useful to us, not part of the
+# project's actual PL/PS functionality, never meant to be tracked.
+private/
+
+# Tool config directories -- must stay at this exact path for the tools
+# themselves to find them, so they're gitignored in place rather than
+# moved into private/.
+.claude/
+.vscode/
+
+# Python bytecode cache
+__pycache__/

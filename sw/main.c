@@ -1,30 +1,18 @@
 /*
- * Minimal bare-metal bring-up test for the PL-side AXI peripheral cluster
+ * Bare-metal bring-up test for the PL-side AXI peripheral cluster
  * (src/axi_if.sv + src/axi_registers.sv + src/axi_spi.sv), run on the
- * Cortex-A9 over JTAG (no FSBL/BSP — see startup.S for what that implies
- * about CPU state at entry).
+ * Cortex-A9 over JTAG (no FSBL/BSP -- see startup.S). Raw pointer access
+ * only, no HAL/BSP.
  *
- * Raw pointer access only, no HAL/BSP macros exist in this project to use
- * instead.
+ * Addressing: axi_if fans wen/ren out to every peripheral in parallel; each
+ * self-selects on addr[23:16] == its own PERIPH_ID (see src/axi_if.sv).
+ * addr[31:24] is fixed by GP0's window (0x40-0x7F) so PERIPH_ID can't live
+ * there. See README.md's "Zynq-7000 GP0/GP1 address map" before adding a
+ * peripheral.
  *
- * Addressing: axi_if fans a single wen/ren bus out to every peripheral in
- * parallel (no interconnect, no per-slave address range) -- each
- * peripheral self-selects by comparing addr[23:16] against its own
- * PERIPH_ID (see src/axi_if.sv's port-list comment). This replaced the
- * old axi_interconnect range-decode scheme entirely. addr[31:24] is
- * NEVER inspected by any peripheral -- it's whatever M_AXI_GP0 fixes it
- * to (always 0x40-0x7F, since GP0's window is 0x4000_0000-0x7FFF_FFFF;
- * this design doesn't wire up GP1 at all), which is exactly why the
- * PERIPH_ID field lives at addr[23:16] rather than addr[31:24] --
- * putting it there would make it unreachable, since a real GP0 address
- * can never have a top byte outside 0x40-0x7F. See README.md's
- * "Zynq-7000 GP0/GP1 address map" section before ever picking a base for
- * a new peripheral.
- *
- * axi_registers (PERIPH_ID 0x01) register map, word-aligned:
- *   offset 0x00 (register 0) = CTRL, bit[0] = blink enable
- *   offset 0x04 (register 1) = DIV,  bits[4:0] = which counter bit drives
- *                               the LED
+ * axi_registers (PERIPH_ID 0x01), word-aligned:
+ *   0x00 CTRL, bit[0] = blink enable
+ *   0x04 DIV,  bits[4:0] = which counter bit drives the LED
  */
 
 #include <stddef.h>
@@ -35,28 +23,19 @@
 #define AXI_BASE (0x40000000u | (0x01u << 16)) /* GP0 base | axi_registers' PERIPH_ID */
 
 /*
- * axi_spi (PERIPH_ID 0x02) is a direct, single-transaction bridge, not a
- * register file -- there's no CTRL/ADDR/WDATA/STATUS staging anymore
- * (that was an earlier, since-abandoned design). One AXI write IS one
- * complete AD9361 SPI write (AD9361 register address in the low 10 bits
- * of the AXI address, data byte in the write data); one AXI read IS one
- * complete SPI read the same way. Both block on the AXI bus itself
- * (BVALID/RVALID) until the real ~24-edge SPI transaction finishes, so no
- * manual status polling is needed here -- see src/axi_spi.sv's header
- * comment for the full contract.
+ * axi_spi (PERIPH_ID 0x02): direct single-transaction bridge, not a
+ * register file. One AXI write/read IS one complete AD9361 SPI write/read
+ * (AD9361 register address in the low 10 bits of the AXI address); both
+ * block on BVALID/RVALID until the SPI transaction finishes. See
+ * src/axi_spi.sv's header for the full contract.
  */
 #define SPI_AXI_BASE (0x40000000u | (0x02u << 16)) /* GP0 base | axi_spi's PERIPH_ID */
 
 /*
- * axi_cdc_status (PERIPH_ID 0x03) is a read-only, 64 x 8-bit-lane status
- * regmap native to dsp_clk (see src/axi_cdc_status.sv) -- reg0-9 currently
- * carry RX-interface diagnostics (rx_data snapshot, valid/error counters,
- * raw rx_frame_s/rx_data taps, a dsp_clk heartbeat), reg10-63 reserved for
- * the user's own correlator/histogram DSP work. `addr` below is a byte
- * offset from this base, word-aligned (bits[1:0] ignored) -- one AXI read
- * returns one 8-bit lane, zero-extended, matching the addresses used by
- * this project's JTAG diagnostic scripts (e.g. CDC_AXI_BASE+0x04 = reg1
- * = valid_count).
+ * axi_cdc_status (PERIPH_ID 0x03): read-only 64 x 8-bit-lane status regmap
+ * native to dsp_clk (src/axi_cdc_status.sv). reg0-9 = RX-interface
+ * diagnostics, reg10-63 reserved. `addr` is a word-aligned byte offset;
+ * one AXI read returns one 8-bit lane, zero-extended.
  */
 #define CDC_AXI_BASE (0x40000000u | (0x03u << 16)) /* GP0 base | axi_cdc_status's PERIPH_ID */
 
@@ -71,14 +50,10 @@
 #define PIN_R1_MODE  (1u << 3) /* ad3961_if_rx: 1 = single-RF (R1) decode path */
 
 /*
- * PS7 UART1 (hard peripheral, MIO 8/9 = TX/RX), not AXI/GP0 — this lives
- * on the PS's own internal bus, address/offsets/bit values below taken
- * directly from the vendor's Xilinx BSP header
- * (docs/.../libsrc/uartps_v3_11/src/xuartps_hw.h), not guessed from the
- * TRM by hand. MIO routing + the AMBA clock gate for UART1 are both already
- * programmed by ps7_init.tcl (run by scripts/ps7_jtag_init.tcl) as part of
- * bringing up the rest of PS7 — same mechanism that already brings up DDR —
- * so nothing extra is needed there, this is register-level setup only.
+ * PS7 UART1 (hard peripheral, MIO 8/9 = TX/RX), not AXI/GP0. Offsets/bits
+ * from Xilinx's BSP header (docs/.../uartps_v3_11/src/xuartps_hw.h). MIO
+ * routing + clock gate already done by ps7_init.tcl; this is register
+ * setup only.
  */
 #define UART1_BASE 0xE0001000u
 #define UART_CR      (*(volatile uint32_t *)(UART1_BASE + 0x00u)) /* Control */
@@ -102,13 +77,8 @@
 #define UART_SR_RXEMPTY (1u << 1)
 
 /*
- * Crude busy-wait: no timer peripheral is set up in this minimal bring-up
- * (see startup.S), so there's no calibrated time reference to delay
- * against. This is an approximate "hold this state long enough for a
- * human to see it" loop, not a precise delay — good enough for a visual
- * bring-up test, not something to build real timing on. The volatile
- * asm nop is there so the loop can't be optimized away regardless of
- * what optimization flags this ends up built with.
+ * Crude busy-wait: no timer peripheral is set up, so this is an
+ * uncalibrated approximate delay, not something to build real timing on.
  */
 static void delay(volatile uint32_t count)
 {
@@ -162,40 +132,21 @@ static uint8_t uart1_getc(void)
 }
 
 /*
- * Command protocol over UART1: host sends 8 raw bytes per command (not
- * ASCII hex text), MSB-first, forming a 64-bit word:
- *   byte 7 (received first) = device select: 0x00 = AXI (axi_registers),
- *                              0x08 = SPI (axi_spi -> AD9361),
- *                              0x0C = CDC (axi_cdc_status, read-only),
- *                              0x10 = GEM (GEM0 core registers),
- *                              0x14 = DESC (TX descriptor, DDR scratch),
- *                              0x18 = SLCR (GEM_SLCR_BASE),
- *                              0x1C = DESC_RX (RX descriptor, DDR scratch),
- *                              0x20 = RXBUF (RX per-slot buffers, DDR
- *                              scratch) -- offsets/bases for GEM/DESC/SLCR/
- *                              DESC_RX/RXBUF are in eth0.h
+ * Command protocol (UART1 and UDP, see below): 8 raw bytes, MSB-first:
+ *   byte 0 = device select (AXI/SPI/CDC/GEM/DESC/SLCR/DESC_RX/RXBUF/SYS)
+ *   byte 1 = 0x00 read, 0x01 write (CDC ignores writes, read-only from AXI)
+ *   bytes [2:3] = 16-bit address, big-endian, byte offset from the
+ *                 device's base (SPI: AD9361 register, bits[9:0])
+ *   bytes [4:7] = 32-bit data (write value; SPI uses only the low byte)
+ * A read's 32-bit reply goes back the same way it arrived, big-endian.
  *
- * The same 8-byte command shape is also accepted over UDP (port
- * UDP_CMD_PORT, board IP BOARD_IP0-3, both in eth0.h): a request payload
- * is a back-to-back array of these 8-byte commands, executed in order
- * until either a stop command (all 0xFF in bytes 0-3, all 0x00 in bytes
- * 4-7 -- i.e. 0xFFFFFFFF00000000) or the payload runs out, whichever
- * comes first. Every command that would produce a reply over UART still
- * does; those same reply values are ALSO packed in order into one
- * batched UDP reply datagram sent back to the requester once the array
- * finishes (not one UDP frame per command). See eth_process_udp_command_frame().
- *   byte 6                  = 0x00 read, 0x01 write (CDC ignores writes --
- *                               the peripheral itself is read-only from AXI)
- *   bytes [5:4]              = 16-bit address, big-endian — a byte offset
- *                               from the selected device's base, except
- *                               SPI (the AD9361 register address, bits[9:0])
- *   bytes [3:0]              = 32-bit data (write value, ignored on
- *                               read) — for SPI, only the low byte is
- *                               used
- * On a read, the 32-bit value is sent back over UART1 as 4 raw bytes,
- * big-endian, mirroring the request's own data field layout. For SPI
- * reads this is the AD9361 data byte, zero-extended; for CDC reads this
- * is the addressed 8-bit lane, zero-extended.
+ * The same 8-byte shape is also accepted over UDP (port UDP_CMD_PORT,
+ * board IP BOARD_IP0-3, eth0.h), gated by a required 4-byte preamble
+ * (UDP_CMD_PREAMBLE) so stray broadcast/multicast traffic can't be
+ * executed as commands. After the preamble: a back-to-back array of
+ * commands, run until a stop sentinel (8 bytes of 0xFF) or the payload
+ * ends. Replies still go to UART as normal, and are also batched into one
+ * UDP reply sent after the array finishes.
  */
 #define CMD_DEV_AXI  0x00u
 #define CMD_DEV_SPI  0x08u
@@ -228,21 +179,12 @@ static void uart1_put32(uint32_t v)
 }
 
 /*
- * One full AD9361 SPI register transaction. A single store to axi_spi's
- * window IS the write (AXI blocks on BVALID until the real SPI write
- * completes); a single load IS the read the same way (blocks on RVALID).
- * No separate launch/poll steps anymore. ad9361_addr only uses its low
- * 10 bits (AD9361's ADDR field), matching axi_spi.sv's own
- * r_addr[11:2]/w_addr[11:2] usage -- shifted up by 2 (not placed at
- * [9:0] directly) specifically so the resulting pointer stays word-
- * aligned: AD9361 register numbers are arbitrary 10-bit values, not
- * restricted to multiples of 4, and a plain 32-bit store/load to an
- * unaligned Strongly-Ordered/Device address is an immediate ARM
- * Alignment Fault, not something that reaches the AXI bus at all. Found
- * this the hard way on real hardware: REG_CTRL (0x3DF) faulted on the
- * very first SPI write, landing in _data_abort_handler with
- * DFSR=0x801 (alignment fault, write) -- see the halt-and-inspect
- * procedure in README.md if this class of bug shows up again.
+ * One AD9361 SPI transaction: a single store/load to axi_spi's window IS
+ * the write/read (blocks on BVALID/RVALID). ad9361_addr (10 bits) is
+ * shifted up by 2 rather than placed at [9:0] directly so the resulting
+ * pointer stays word-aligned -- AD9361 register numbers aren't restricted
+ * to multiples of 4, and an unaligned store to Strongly-Ordered memory is
+ * an immediate ARM Alignment Fault.
  */
 static uint8_t spi_transact(uint16_t ad9361_addr, uint8_t is_write, uint8_t wdata)
 {
@@ -257,11 +199,10 @@ static uint8_t spi_transact(uint16_t ad9361_addr, uint8_t is_write, uint8_t wdat
 }
 
 /*
- * AD9361 registers/bitfields needed to bring the chip up to the point
- * where either test or mission mode can do anything -- pin release,
- * BBPLL, LVDS parallel port. Values verified register-by-register
- * against ADI's driver (docs/.../AD936X_PS/AD936X/ad9361/ad9361.c:
- * ad9361_setup()/ad9361_bbpll_set_rate()), not guessed.
+ * AD9361 registers/bitfields to bring the chip up far enough for either
+ * test or mission mode: pin release, BBPLL, LVDS parallel port. Verified
+ * against ADI's driver (docs/.../ad9361.c: ad9361_setup()/
+ * ad9361_bbpll_set_rate()).
  */
 #define AD9361_REG_CTRL      0x3DFu
 #define AD9361_CTRL_ENABLE   (1u << 0)
@@ -310,27 +251,17 @@ static uint8_t spi_transact(uint16_t ad9361_addr, uint8_t is_write, uint8_t wdat
 #define AD9361_REG_PARALLEL_PORT_CONF_2 0x011u
 #define AD9361_REG_PARALLEL_PORT_CONF_3 0x012u
 
-/*
- * REG_ENSM_CONFIG_1 -- the ENSM state-machine control register, used by
- * ad9361_common_init() to force the real ALERT->RX transition (common to
- * both modes, see below). ad9361_registers.md and ADI's own driver
- * (docs/.../AD936X_PS/AD936X/ad9361/ad9361.c/.h, ad9361_ensm_set_state())
- * document the full bit layout; only the bits actually used here are named.
- */
+/* REG_ENSM_CONFIG_1: ENSM state-machine control, used to force the real
+ * ALERT->RX transition (common to both modes). See ad9361_registers.md /
+ * ADI's ad9361_ensm_set_state() for the full bit layout. */
 #define AD9361_REG_ENSM_CONFIG_1 0x014u
 #define AD9361_FORCE_RX_ON                 (1u << 6)
 #define AD9361_LEVEL_MODE                  (1u << 3)
 #define AD9361_FORCE_ALERT_STATE           (1u << 2)
 #define AD9361_TO_ALERT                    (1u << 0)
 
-/*
- * REG_OBSERVE_CONFIG / REG_BIST_CONFIG -- test-mode specific: the RX-side
- * BIST/PRBS pattern generator, per ad9361_registers.md and ADI's driver
- * (ad9361_bist_prbs()/ad9361_bist_loopback(), how ad9361_conv.c calls
- * them). Not a full port of ADI's driver -- just the register writes
- * needed to get the RX-side BIST pattern flowing once the chip is already
- * in real RX state (see ad9361_common_init() below for how it gets there).
- */
+/* REG_OBSERVE_CONFIG / REG_BIST_CONFIG: test-mode RX-side BIST/PRBS
+ * pattern generator, per ad9361_registers.md / ADI's ad9361_bist_prbs(). */
 #define AD9361_REG_OBSERVE_CONFIG 0x3F5u
 
 #define AD9361_REG_BIST_CONFIG 0x3F4u
@@ -338,17 +269,12 @@ static uint8_t spi_transact(uint16_t ad9361_addr, uint8_t is_write, uint8_t wdat
 #define AD9361_BIST_CTRL_POINT_RX(x)  (((x) & 0x3u) << 2)
 
 /*
- * RX LO synthesizer (98MHz) + coarse RX_DATA_DELAY bring-up. Derived
- * register-by-register from ADI's driver
- * (docs/.../AD936X_PS/AD936X/ad9361/ad9361.c:
- * ad9361_txrx_synth_cp_calib()/ad9361_rfpll_vco_init()/
- * ad9361_calc_rfpll_int_divder()/ad9361_rfpll_int_set_rate()) and hand-
- * verified on real hardware via scripts/_rx_lo_synth_98mhz.tcl and
- * scripts/_clkdata_delay_sweep_live.tcl -- see README.md's "AD9361 RX
- * digital bring-up" section for the full derivation. Common to both test
- * and mission mode: reaching real RX state (REG_STATE=0x08) is what
- * actually unblocks BIST/PRBS data flowing too, not something
- * mission-mode-specific -- see ad9361_common_init() below.
+ * RX LO synthesizer (98MHz) + coarse RX_DATA_DELAY bring-up. Derived from
+ * ADI's ad9361_txrx_synth_cp_calib()/ad9361_rfpll_vco_init()/
+ * ad9361_rfpll_int_set_rate(), hand-verified via scripts/_rx_lo_synth_98mhz.tcl
+ * and scripts/_clkdata_delay_sweep_live.tcl -- see README.md's "AD9361 RX
+ * digital bring-up". Common to both modes: reaching real RX state is what
+ * unblocks BIST/PRBS data flowing too.
  */
 #define AD9361_REG_ENSM_MODE     0x013u
 #define AD9361_FDD_MODE          (1u << 0)
@@ -518,16 +444,11 @@ static void ad9361_rx_lo_synth_98mhz(void)
 }
 
 /*
- * One-time AD9361 bring-up shared by both test and mission mode: release
- * the chip's physical control pins, lock the BBPLL, configure the LVDS
- * parallel port, lock the RX LO synthesizer (98MHz), tune the coarse
- * RX_DATA_DELAY, and force the real ALERT->RX ENSM transition. Neither
- * mode can do anything before this has run. Runs once at boot so a fresh
- * FPGA upload doesn't need this replayed by hand over UART. Does NOT set
- * the RX sample rate (RX clock-divider chain) -- see bring_up_uart.txt for
- * that, kept manual on purpose (see the comment at the end of this
- * function) since it's still an actively-tuned knob, unlike the RX LO
- * synth/delay values below which are now derived and settled.
+ * One-time AD9361 bring-up shared by test and mission mode: release the
+ * control pins, lock the BBPLL, configure the LVDS parallel port, lock
+ * the RX LO synth (98MHz), tune RX_DATA_DELAY, force ALERT->RX. Runs once
+ * at boot. Does NOT set the RX sample rate/clock-divider chain -- see
+ * bring_up_uart.txt, kept manual since it's still an actively-tuned knob.
  */
 static void ad9361_common_init(void)
 {
@@ -572,30 +493,15 @@ static void ad9361_common_init(void)
     ad9361_spi_write(AD9361_REG_ENSM_CONFIG_1,
                       AD9361_LEVEL_MODE | AD9361_TO_ALERT | AD9361_FORCE_RX_ON); /* ALERT -> real RX */
 
-    /*
-     * Deliberately stops here for the RX clock-divider chain only
-     * (REG_BBPLL + REG_RX_ENABLE_FILTER_CTRL) -- it's still an
-     * actively-tuned knob (see bring_up_uart.txt), and baking a sample
-     * rate in here would mean a full rebuild+reupload every time it
-     * changes instead of just a UART command. The RX LO synth/delay
-     * tuning above are different: both are now derived and hand-verified
-     * settled values, not still being experimentally tuned, so they run
-     * unconditionally here rather than waiting on a mode-select command.
-     */
+    /* Deliberately stops here: RX sample rate (REG_BBPLL +
+     * REG_RX_ENABLE_FILTER_CTRL) stays a runtime UART knob, not baked in
+     * -- see bring_up_uart.txt. */
 }
 
 /*
- * Test mode: the chip is already in real RX state by the time this can be
- * called (ad9361_common_init() forces the ALERT->RX transition
- * unconditionally at boot -- see there for why that's common to both
- * modes now, not mission-mode-specific). All that's left here is the
- * actual test-mode-specific step: enable the RX-side BIST pattern
- * generator (REG_BIST_CONFIG, BIST_CTRL_POINT=2=RX injection), which
- * substitutes a fixed digital pattern ahead of the RF front end. ADI's
- * driver doesn't expose a PRBS7-vs-other-length select -- this is the
- * chip's one fixed BIST pattern, referred to as PRBS7 per how this
- * project intends to use it, not confirmed against the AD9361 datasheet
- * text itself (not present in this repo's docs).
+ * Test mode: chip is already in real RX state (ad9361_common_init()
+ * forces ALERT->RX at boot). Only remaining step: enable the RX-side
+ * BIST pattern generator (BIST_CTRL_POINT=2=RX injection).
  */
 static void enter_test_mode(void)
 {
@@ -640,6 +546,7 @@ static uint8_t dispatch_command(const uint8_t *req, uint32_t *reply)
     uint16_t addr = (uint16_t)(((uint16_t)addr_hi << 8) | addr_lo);
 
     if (dev == CMD_DEV_AXI) {
+        if (addr & 0x3u) { return 0u; }
         volatile uint32_t *reg = (volatile uint32_t *)(AXI_BASE + addr);
         if (rw & CMD_RW_WRITE) {
             *reg = data;
@@ -659,11 +566,13 @@ static uint8_t dispatch_command(const uint8_t *req, uint32_t *reply)
          * only here; writes are simply ignored rather than ever issuing a
          * real AXI store that would fault. */
         if (!(rw & CMD_RW_WRITE)) {
+            if (addr & 0x3u) { return 0u; }
             volatile uint32_t *reg = (volatile uint32_t *)(CDC_AXI_BASE + addr);
             *reply = *reg;
             has_reply = 1u;
         }
     } else if (dev == CMD_DEV_GEM) {
+        if (addr & 0x3u) { return 0u; }
         volatile uint32_t *reg = (volatile uint32_t *)(GEM_CORE_BASE + addr);
         if (rw & CMD_RW_WRITE) {
             *reg = data;
@@ -672,6 +581,7 @@ static uint8_t dispatch_command(const uint8_t *req, uint32_t *reply)
             has_reply = 1u;
         }
     } else if (dev == CMD_DEV_SLCR) {
+        if (addr & 0x3u) { return 0u; }
         volatile uint32_t *reg = (volatile uint32_t *)(GEM_SLCR_BASE + addr);
         if (rw & CMD_RW_WRITE) {
             *reg = data;
@@ -680,6 +590,7 @@ static uint8_t dispatch_command(const uint8_t *req, uint32_t *reply)
             has_reply = 1u;
         }
     } else if (dev == CMD_DEV_DESC) {
+        if (addr & 0x3u) { return 0u; }
         volatile uint32_t *reg = (volatile uint32_t *)(GEM_DESCRIPTOR_TX + addr);
         if (rw & CMD_RW_WRITE) {
             *reg = data;
@@ -688,6 +599,7 @@ static uint8_t dispatch_command(const uint8_t *req, uint32_t *reply)
             has_reply = 1u;
         }
     } else if (dev == CMD_DEV_DESC_RX) {
+        if (addr & 0x3u) { return 0u; }
         volatile uint32_t *reg = (volatile uint32_t *)(GEM_DESCRIPTOR_RX + addr);
         if (rw & CMD_RW_WRITE) {
             *reg = data;
@@ -696,6 +608,7 @@ static uint8_t dispatch_command(const uint8_t *req, uint32_t *reply)
             has_reply = 1u;
         }
     } else if (dev == CMD_DEV_RXBUF) {
+        if (addr & 0x3u) { return 0u; }
         volatile uint32_t *reg = (volatile uint32_t *)(GEM_RX_BUF_BASE + addr);
         if (rw & CMD_RW_WRITE) {
             *reg = data;
@@ -733,33 +646,45 @@ static void process_uart_command(void)
 }
 
 /*
- * Stop sentinel for a UDP command array: dev/rw/addr all 0xFF, data all
- * 0x00 -- a combination no real command uses (every real device select
- * value is well under 0xFF).
+ * Stop sentinel for a UDP command array: all 8 bytes 0xFF -- a pattern no
+ * real command uses (every real device select value is well under 0xFF).
  */
 static uint8_t is_stop_command(const uint8_t *cmd)
 {
-    return cmd[0] == 0xFFu && cmd[1] == 0xFFu && cmd[2] == 0xFFu && cmd[3] == 0xFFu
-        && cmd[4] == 0x00u && cmd[5] == 0x00u && cmd[6] == 0x00u && cmd[7] == 0x00u;
+    for (uint32_t i = 0u; i < 8u; i++) {
+        if (cmd[i] != 0xFFu) {
+            return 0u;
+        }
+    }
+    return 1u;
 }
 
 /*
- * Execute a UDP-carried command array (payload of req_frame, already
- * bounded by the caller to the smaller of the UDP header's own claimed
- * length and the RX descriptor's actual received length -- never trust
- * the stop sentinel alone to terminate, since a truncated/malformed
- * payload might never contain one). Every reply still goes to UART, same
- * as if the identical command had arrived there; replies are also packed
- * back-to-back into one batched UDP reply, sent once at the end -- not
- * one UDP frame per command. If packing the next reply would overflow
- * ETH_UDP_MAX_REPLY_BYTES, processing stops there rather than silently
- * dropping that command's reply from an otherwise-complete-looking batch.
+ * Required first 4 bytes of any UDP command payload -- ASCII "COM" + NUL.
+ * Without this, any stray UDP packet matching the board's IP:port would
+ * have its payload blindly executed as register read/write commands.
+ */
+static const uint8_t UDP_CMD_PREAMBLE[4] = { 'C', 'O', 'M', 0x00u };
+
+/*
+ * Execute a UDP-carried command array. `payload_len` is already bounded
+ * to the smaller of the UDP header's claimed length and the RX
+ * descriptor's actual length -- never trust the stop sentinel alone,
+ * since a truncated payload might never contain one. Replies go to UART
+ * as usual and are also batched into one UDP reply sent at the end.
  */
 static void eth_process_udp_command_frame(const uint8_t *req_frame, const uint8_t *payload, uint16_t payload_len)
 {
     uint8_t reply_batch[ETH_UDP_MAX_REPLY_BYTES];
     uint16_t reply_bytes = 0u;
-    uint16_t offset = 0u;
+    uint16_t offset;
+
+    if (payload_len < sizeof(UDP_CMD_PREAMBLE)
+        || payload[0] != UDP_CMD_PREAMBLE[0] || payload[1] != UDP_CMD_PREAMBLE[1]
+        || payload[2] != UDP_CMD_PREAMBLE[2] || payload[3] != UDP_CMD_PREAMBLE[3]) {
+        return;
+    }
+    offset = (uint16_t)sizeof(UDP_CMD_PREAMBLE);
 
     while (offset + 8u <= payload_len) {
         const uint8_t *cmd = payload + offset;
@@ -794,49 +719,60 @@ static void eth_process_udp_command_frame(const uint8_t *req_frame, const uint8_
 }
 
 /*
- * Called once per main-loop iteration: services at most one waiting RX
- * frame per call (matching how process_uart_command() only ever handles
- * one command per call), dispatching by EtherType/protocol/port, then
- * always releases the descriptor whether or not anything matched.
+ * Called once per main-loop iteration: drains every RX frame already
+ * waiting (not just one), dispatching each by EtherType/protocol/port and
+ * always releasing its descriptor. Draining everything per call (rather
+ * than one frame at a time) keeps traffic bursts from exhausting the
+ * 8-entry ring faster than it's serviced.
  */
 static void eth_service(void)
 {
     uint16_t len;
-    uint8_t *frame = (uint8_t *)eth_rx_poll(&len);
-    if (frame == NULL) {
-        return;
-    }
+    uint8_t *frame;
 
-    uint16_t ethertype = ((uint16_t)frame[12] << 8) | frame[13];
-    if (ethertype == 0x0806u) {
-        uint16_t oper = ((uint16_t)frame[20] << 8) | frame[21];
-        uint8_t tpa_match = frame[38] == BOARD_IP0 && frame[39] == BOARD_IP1
-                          && frame[40] == BOARD_IP2 && frame[41] == BOARD_IP3;
-        if (oper == 1u && tpa_match) {
-            /* TEMP disabled for crash isolation, 2026-08-26 -- see
-             * eth0_mdio_bringup_status.md. Still detects/matches the ARP
-             * request, just doesn't build/send a reply, to test whether
-             * eth_send_arp_reply()+eth_tx_reserve/commit is the trigger
-             * or whether the crash survives with only RX-side activity. */
-            /* eth_send_arp_reply(frame); */
-        }
-    } else if (ethertype == 0x0800u) {
-        uint8_t proto = frame[23];
-        uint8_t dest_ip_match = frame[30] == BOARD_IP0 && frame[31] == BOARD_IP1
-                              && frame[32] == BOARD_IP2 && frame[33] == BOARD_IP3;
-        uint16_t dest_port = ((uint16_t)frame[36] << 8) | frame[37];
-        if (proto == 17u && dest_ip_match && dest_port == UDP_CMD_PORT) {
-            uint16_t udp_len = ((uint16_t)frame[38] << 8) | frame[39];
-            uint16_t payload_len = (udp_len > 8u) ? (udp_len - 8u) : 0u;
-            uint16_t max_from_frame = (len > ETH_UDP_HEADER_LEN) ? (uint16_t)(len - ETH_UDP_HEADER_LEN) : 0u;
-            if (payload_len > max_from_frame) {
-                payload_len = max_from_frame;
+    while ((frame = (uint8_t *)eth_rx_poll(&len)) != NULL) {
+        uint16_t ethertype = ((uint16_t)frame[12] << 8) | frame[13];
+        if (ethertype == 0x0806u) {
+            /* ARP: 14-byte Ethernet header + 28-byte payload = 42 bytes
+             * minimum -- guard against reading past a short frame. */
+            if (len >= 42u) {
+                uint16_t oper = ((uint16_t)frame[20] << 8) | frame[21];
+                uint8_t tpa_match = frame[38] == BOARD_IP0 && frame[39] == BOARD_IP1
+                                  && frame[40] == BOARD_IP2 && frame[41] == BOARD_IP3;
+                if (oper == 1u && tpa_match) {
+                    eth_send_arp_reply(frame);
+                }
             }
-            eth_process_udp_command_frame(frame, frame + ETH_UDP_HEADER_LEN, payload_len);
+        } else if (ethertype == 0x0800u) {
+            /* Same reasoning as ARP above: header fields read below need
+             * ETH_UDP_HEADER_LEN (42) bytes minimum. */
+            if (len >= ETH_UDP_HEADER_LEN) {
+                uint8_t proto = frame[23];
+                uint8_t dest_ip_match = frame[30] == BOARD_IP0 && frame[31] == BOARD_IP1
+                                      && frame[32] == BOARD_IP2 && frame[33] == BOARD_IP3;
+                uint16_t dest_port = ((uint16_t)frame[36] << 8) | frame[37];
+                if (proto == 17u && dest_ip_match && dest_port == UDP_CMD_PORT) {
+                    uint16_t udp_len = ((uint16_t)frame[38] << 8) | frame[39];
+                    uint16_t payload_len = (udp_len > 8u) ? (udp_len - 8u) : 0u;
+                    uint16_t max_from_frame = (len > ETH_UDP_HEADER_LEN) ? (uint16_t)(len - ETH_UDP_HEADER_LEN) : 0u;
+                    if (payload_len > max_from_frame) {
+                        payload_len = max_from_frame;
+                    }
+                    eth_process_udp_command_frame(frame, frame + ETH_UDP_HEADER_LEN, payload_len);
+                }
+            }
         }
+
+        eth_rx_release();
     }
 
-    eth_rx_release();
+    /* GEM latches BNA when it finds the current descriptor still
+     * software-owned with a frame ready to deposit, and won't resume
+     * until software both frees a descriptor (done above) and explicitly
+     * acknowledges BNA here (write-1-to-clear). */
+    if (GEM_RXSR & 0x1u) {
+        GEM_RXSR = 0x1u;
+    }
 }
 
 void main(void)
@@ -857,13 +793,9 @@ void main(void)
      * speed(10=1000M,01=100M,00=10M), bit3 duplex(1=full), bit2 link. */
     uart1_put32(phy_get_link_status());
 
-    /* Register read/write console: service whichever of UART/Ethernet has
-     * work each pass, forever. uart1_available() is a non-blocking check
-     * -- process_uart_command() itself still blocks internally once a
-     * command has actually started arriving, which is fine since a host
-     * writes all 8 bytes as one burst; it just never blocks indefinitely
-     * waiting for a *first* byte that isn't coming, which would otherwise
-     * starve eth_service() forever. */
+    /* Service whichever of UART/Ethernet has work each pass, forever.
+     * uart1_available() is non-blocking so a missing UART byte can't
+     * starve eth_service(). */
     for (;;) {
         if (uart1_available()) {
             process_uart_command();

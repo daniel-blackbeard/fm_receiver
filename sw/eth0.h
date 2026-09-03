@@ -50,18 +50,16 @@
 #define GEM_DESC_FLAGS_RX(i) (*(volatile uint32_t *) (GEM_DESCRIPTOR_RX + (uint32_t)(i) * 8u + 4u))
 
 /* First of GEM_RX_RING_SIZE per-slot RX buffers, right after the TX
- * buffer region (FRAME_BASE_ADDR .. FRAME_BASE_ADDR + 64*sizeof(eth_frame)).
- * Exposed here (rather than left as an inline expression) so a UART debug
- * peek path can reach it too, not just gem_setup()'s own ring-init loop. */
+ * buffer region. Named (not inlined) so gem_setup()'s ring-init loop and
+ * eth_rx_poll()/eth_rx_release() can't drift apart on the same value. */
 #define GEM_RX_BUF_BASE (FRAME_BASE_ADDR + 64u * sizeof(eth_frame))
-/* Named so gem_setup()'s ring-init loop and eth_rx_poll()/eth_rx_release()
- * can't silently drift apart on the same magic number. */
-#define GEM_RX_BUF_STRIDE 256u
+/* Real 1518-byte Ethernet MTU (rounded up), not a small placeholder --
+ * keeps one frame within one RX descriptor. */
+#define GEM_RX_BUF_STRIDE 1536u
 
 /* Board identity for the UDP command protocol -- MAC matches
- * GEM_SPEC_ADDR1_BOT/TOP in gem_setup() (02:00:de:ad:be:ef). No DHCP/ARP-
- * learned addressing anywhere in this minimal stack; both ends are fixed,
- * known values. */
+ * GEM_SPEC_ADDR1_BOT/TOP in gem_setup() (02:00:de:ad:be:ef). Fixed, no
+ * DHCP/ARP-learned addressing. */
 #define BOARD_IP0 192u
 #define BOARD_IP1 168u
 #define BOARD_IP2 3u
@@ -93,46 +91,33 @@ void eth_tx_commit(uint16_t len);
 void eth_send_test_frame(void);
 
 /* RX ring consumer, mirroring eth_tx_reserve()/eth_tx_commit(): poll
- * returns a pointer to the current RX slot's buffer and its received
- * length if hardware has a frame ready (NEW==1), or NULL if not (still
- * hardware's turn) -- never blocks. release() hands that same slot back
- * to hardware (clears NEW) and advances to the next slot; call it exactly
- * once per successful poll(), after the frame's contents have been fully
- * used, since hardware may overwrite the buffer as soon as it's released. */
+ * returns a pointer to the current RX slot's buffer and length if a frame
+ * is ready (NEW==1), or NULL otherwise -- never blocks. release() hands
+ * the slot back to hardware and advances; call exactly once per
+ * successful poll(), after the frame is no longer needed. */
 void *eth_rx_poll(uint16_t *len_out);
 void eth_rx_release(void);
 
-/* Minimal ARP responder: given a pointer to a received frame already
- * confirmed to be an ARP request for this board's own IP, builds and
- * sends the matching ARP reply. */
+/* Minimal ARP responder: given a received frame already confirmed to be
+ * an ARP request for this board's IP, builds and sends the reply. */
 void eth_send_arp_reply(const uint8_t *req_frame);
 
-/* UDP reply builder, split into reserve/commit like the TX ring itself,
- * since the final IP/UDP length fields and IP checksum can't be written
- * until the caller knows how much payload it wrote. reserve() takes the
- * *request* frame (to swap src/dst MAC/IP/port for the reply) and returns
- * a pointer to where payload should be written, or NULL if the TX ring is
- * full; commit() finalizes headers/checksum/padding and sends it. At most
- * ETH_UDP_MAX_REPLY_BYTES of payload fits -- caller's responsibility to
- * respect that bound before calling commit(). */
+/* UDP reply builder, split reserve/commit like the TX ring, since the
+ * final length fields and checksum can't be written until the caller
+ * knows the payload size. reserve() takes the *request* frame (to swap
+ * src/dst for the reply); commit() finalizes and sends. At most
+ * ETH_UDP_MAX_REPLY_BYTES fits -- caller's responsibility. */
 void *eth_udp_reply_reserve(const uint8_t *req_frame);
 void eth_udp_reply_commit(uint16_t payload_len);
 
-/* Test-only: synthesizes a valid ARP request for this board's own IP
- * directly into the current RX slot (as if hardware had just received
- * it) and sets that slot's NEW bit, so eth_service() picks it up on its
- * very next call. Exists to reproduce the ARP-path crash on demand from
- * a single UART command, instead of depending on real, unpredictably-
- * timed network traffic to trigger it. */
+/* Test-only: synthesizes an ARP request for this board's IP directly into
+ * the current RX slot, as if hardware had just received it. */
 void eth_test_inject_arp_request(void);
 
-/* packed: wire fields must be byte-contiguous, no compiler-inserted
- * padding -- byte arrays already have 1-byte alignment so this is
- * redundant today, but it stays correct if a multi-byte field (e.g. a
- * checksum) is ever added later. uint8_t arrays instead of uint16_t/
- * uint32_t also sidesteps endianness: this CPU is little-endian, the
- * wire format isn't, and a byte you write is a byte that lands in
- * memory in that exact order, no swap needed. */
+/* packed: wire fields must be byte-contiguous. uint8_t arrays (not
+ * uint16_t/uint32_t) sidestep endianness -- this CPU is little-endian,
+ * the wire format isn't, and a byte written lands in memory in that
+ * exact order. */
 typedef struct __attribute__((packed)) {
     uint8_t des_mac[6];
     uint8_t src_mac[6];

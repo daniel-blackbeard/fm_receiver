@@ -1,31 +1,20 @@
 /*
- * Minimal Cortex-A9 startup code for bare-metal JTAG bring-up (no FSBL,
- * no BSP). Sets a known CPU state, installs an exception vector table,
- * enables the MMU + instruction cache, sets up a stack, and hands off to
- * main(). xsdb sets PC directly to _start over JTAG, so there's no
- * hardware reset vector dependency to satisfy.
+ * Minimal Cortex-A9 startup for bare-metal JTAG bring-up (no FSBL/BSP).
+ * Sets a known CPU state, installs an exception vector table, enables
+ * MMU + I-cache, sets up a stack, hands off to main(). xsdb sets PC
+ * directly to _start over JTAG.
  *
- * The exception vector table isn't strictly required for that reason,
- * but is kept anyway: without it, an unexpected exception falls through
- * to whatever's at the default 0x0 vector base and executes it, which is
- * unpleasant to debug over JTAG. Each handler here just traps to an
- * infinite loop instead, which at least says *that* something trapped
- * and roughly where (see README.md for the halt-and-inspect procedure
- * this is designed around, and the investigation that led to the current
- * MMU/cache/erratum configuration below).
+ * Vector table: kept even though xsdb entry doesn't need it, so an
+ * unexpected exception traps to an infinite loop instead of falling
+ * through to whatever's at 0x0 -- see README.md's halt-and-inspect
+ * procedure.
  *
- * MMU: enabled, flat identity-mapped table (mmu_table below). DDR is
- * Normal/Cacheable -- has to be, since our own code lives there and
- * Strongly Ordered/Device memory can't safely host instruction fetch.
- * Everything else (PL peripherals, PS7 UART/SPI/etc.) is Strongly
- * Ordered, same behavior as with the MMU off. Only the instruction cache
- * is enabled (SCTLR.I) -- data cache stays off, so this only changes how
- * code gets fetched, not how data/peripheral accesses behave.
+ * MMU: flat identity-mapped (mmu_table below). DDR is Normal/Cacheable
+ * (code lives there); everything else Strongly Ordered. Only I-cache is
+ * enabled (SCTLR.I) -- data cache stays off.
  *
- * Also clears SCTLR.Z (branch prediction) as a workaround for ARM
- * Cortex-A9 erratum 794073, confirmed applicable to this chip's actual
- * silicon revision (r3p0) but not, on its own, what was causing the
- * hangs this configuration otherwise fixes -- see README.md.
+ * SCTLR.Z (branch prediction) is cleared for Cortex-A9 erratum 794073
+ * (silicon r3p0) -- see README.md.
  */
 
 .syntax unified
@@ -45,11 +34,8 @@ _vectors:
 
 /*
  * Fault reporting: dumps a marker + 3 diagnostic words over UART1 before
- * hanging, so a crash is readable without JTAG at all. Deliberately uses
- * zero stack (no bl, no push/pop -- only branches and registers) since
- * the whole point is to stay robust even when the crash itself corrupted
- * the stack pointer, which is exactly the failure mode this was added to
- * chase (see eth0_mdio_bringup_status.md, RX/ARP path crash investigation).
+ * hanging, so a crash is readable without JTAG. Zero stack use (no bl,
+ * no push/pop) so it stays robust even if the crash corrupted sp.
  * Clobbers r0-r9; never returns.
  */
 fault_report:

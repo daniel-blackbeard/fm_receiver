@@ -102,6 +102,58 @@ wire        m_axi_gp0_wready;
 wire [3:0]  m_axi_gp0_wstrb;
 wire        m_axi_gp0_wvalid;
 
+// S_AXI_HP0 -- opposite direction from M_AXI_GP0 above: PS7 is the AXI
+// *slave* here, so the master-role signals (everything except the
+// *ready outputs) are driven INTO design_1_wrapper from whatever PL
+// master eventually exists, not out of it. Placeholder tie-offs live
+// right after the design_1_wrapper/axi_if instantiations below, driving
+// every master-role signal to a safe idle value until a real master
+// (the planned RX-sample-to-DDR streaming engine) replaces them --
+// see ps7_configure.tcl's S_AXI_HP0 section for the PS7-side setup.
+// Widths and directions taken directly from the generated
+// design_1_wrapper.v (64-bit data, 6-bit ID, confirmed after enabling
+// S_AXI_HP0 -- not guessed): ID width is 6 bits here, not 12 like GP0's,
+// and there's no separate ACLK port since it's wired internally in the
+// BD (looped back to the same FCLK_CLK0 fm_receiver runs on).
+wire [31:0] s_axi_hp0_araddr;
+wire [1:0]  s_axi_hp0_arburst;
+wire [3:0]  s_axi_hp0_arcache;
+wire [5:0]  s_axi_hp0_arid;
+wire [3:0]  s_axi_hp0_arlen;
+wire [1:0]  s_axi_hp0_arlock;
+wire [2:0]  s_axi_hp0_arprot;
+wire [3:0]  s_axi_hp0_arqos;
+wire        s_axi_hp0_arready;
+wire [2:0]  s_axi_hp0_arsize;
+wire        s_axi_hp0_arvalid;
+wire [31:0] s_axi_hp0_awaddr;
+wire [1:0]  s_axi_hp0_awburst;
+wire [3:0]  s_axi_hp0_awcache;
+wire [5:0]  s_axi_hp0_awid;
+wire [3:0]  s_axi_hp0_awlen;
+wire [1:0]  s_axi_hp0_awlock;
+wire [2:0]  s_axi_hp0_awprot;
+wire [3:0]  s_axi_hp0_awqos;
+wire        s_axi_hp0_awready;
+wire [2:0]  s_axi_hp0_awsize;
+wire        s_axi_hp0_awvalid;
+wire [5:0]  s_axi_hp0_bid;
+wire        s_axi_hp0_bready;
+wire [1:0]  s_axi_hp0_bresp;
+wire        s_axi_hp0_bvalid;
+wire [63:0] s_axi_hp0_rdata;
+wire [5:0]  s_axi_hp0_rid;
+wire        s_axi_hp0_rlast;
+wire        s_axi_hp0_rready;
+wire [1:0]  s_axi_hp0_rresp;
+wire        s_axi_hp0_rvalid;
+wire [63:0] s_axi_hp0_wdata;
+wire [5:0]  s_axi_hp0_wid;
+wire        s_axi_hp0_wlast;
+wire        s_axi_hp0_wready;
+wire [7:0]  s_axi_hp0_wstrb;
+wire        s_axi_hp0_wvalid;
+
 // Peripheral bus: axi_if (below) fans this out identically to every
 // peripheral in parallel -- no interconnect, no address-range table.
 // Each peripheral decodes p_waddr[23:16]/p_raddr[23:16] against its own
@@ -251,8 +303,90 @@ design_1_wrapper ps_u (
     .m_axi_gp0_wlast   (m_axi_gp0_wlast),
     .m_axi_gp0_wready  (m_axi_gp0_wready),
     .m_axi_gp0_wstrb   (m_axi_gp0_wstrb),
-    .m_axi_gp0_wvalid  (m_axi_gp0_wvalid)
+    .m_axi_gp0_wvalid  (m_axi_gp0_wvalid),
+
+    .s_axi_hp0_araddr  (s_axi_hp0_araddr),
+    .s_axi_hp0_arburst (s_axi_hp0_arburst),
+    .s_axi_hp0_arcache (s_axi_hp0_arcache),
+    .s_axi_hp0_arid    (s_axi_hp0_arid),
+    .s_axi_hp0_arlen   (s_axi_hp0_arlen),
+    .s_axi_hp0_arlock  (s_axi_hp0_arlock),
+    .s_axi_hp0_arprot  (s_axi_hp0_arprot),
+    .s_axi_hp0_arqos   (s_axi_hp0_arqos),
+    .s_axi_hp0_arready (s_axi_hp0_arready),
+    .s_axi_hp0_arsize  (s_axi_hp0_arsize),
+    .s_axi_hp0_arvalid (s_axi_hp0_arvalid),
+    .s_axi_hp0_awaddr  (s_axi_hp0_awaddr),
+    .s_axi_hp0_awburst (s_axi_hp0_awburst),
+    .s_axi_hp0_awcache (s_axi_hp0_awcache),
+    .s_axi_hp0_awid    (s_axi_hp0_awid),
+    .s_axi_hp0_awlen   (s_axi_hp0_awlen),
+    .s_axi_hp0_awlock  (s_axi_hp0_awlock),
+    .s_axi_hp0_awprot  (s_axi_hp0_awprot),
+    .s_axi_hp0_awqos   (s_axi_hp0_awqos),
+    .s_axi_hp0_awready (s_axi_hp0_awready),
+    .s_axi_hp0_awsize  (s_axi_hp0_awsize),
+    .s_axi_hp0_awvalid (s_axi_hp0_awvalid),
+    .s_axi_hp0_bid     (s_axi_hp0_bid),
+    .s_axi_hp0_bready  (s_axi_hp0_bready),
+    .s_axi_hp0_bresp   (s_axi_hp0_bresp),
+    .s_axi_hp0_bvalid  (s_axi_hp0_bvalid),
+    .s_axi_hp0_rdata   (s_axi_hp0_rdata),
+    .s_axi_hp0_rid     (s_axi_hp0_rid),
+    .s_axi_hp0_rlast   (s_axi_hp0_rlast),
+    .s_axi_hp0_rready  (s_axi_hp0_rready),
+    .s_axi_hp0_rresp   (s_axi_hp0_rresp),
+    .s_axi_hp0_rvalid  (s_axi_hp0_rvalid),
+    .s_axi_hp0_wdata   (s_axi_hp0_wdata),
+    .s_axi_hp0_wid     (s_axi_hp0_wid),
+    .s_axi_hp0_wlast   (s_axi_hp0_wlast),
+    .s_axi_hp0_wready  (s_axi_hp0_wready),
+    .s_axi_hp0_wstrb   (s_axi_hp0_wstrb),
+    .s_axi_hp0_wvalid  (s_axi_hp0_wvalid)
 );
+
+// S_AXI_HP0 placeholder tie-offs -- PS7 is the AXI slave on this port, so
+// every master-role signal (everything below except the three *ready
+// inputs, which are legitimately driven by a real master when one
+// exists) needs to be driven by something right now, or these are
+// floating inputs into a hard IP block, not just unused RTL. All held at
+// a safe idle (every *valid low, so PS7 never even samples the
+// don't-care address/data fields; *ready held ready so nothing on the
+// PS7 side ever blocks waiting for us -- moot today since nothing
+// asserts *valid to it anyway, but this way it stays correct advice for
+// a partial one-direction master later, not just a placeholder that
+// happens to work). Delete this whole block once the real RX-sample-to-
+// DDR streaming master exists and drives these signals directly.
+assign s_axi_hp0_arvalid = 1'b0;
+assign s_axi_hp0_araddr  = 32'd0;
+assign s_axi_hp0_arburst = 2'd0;
+assign s_axi_hp0_arcache = 4'd0;
+assign s_axi_hp0_arid    = 6'd0;
+assign s_axi_hp0_arlen   = 4'd0;
+assign s_axi_hp0_arlock  = 2'd0;
+assign s_axi_hp0_arprot  = 3'd0;
+assign s_axi_hp0_arqos   = 4'd0;
+assign s_axi_hp0_arsize  = 3'd0;
+
+assign s_axi_hp0_awvalid = 1'b0;
+assign s_axi_hp0_awaddr  = 32'd0;
+assign s_axi_hp0_awburst = 2'd0;
+assign s_axi_hp0_awcache = 4'd0;
+assign s_axi_hp0_awid    = 6'd0;
+assign s_axi_hp0_awlen   = 4'd0;
+assign s_axi_hp0_awlock  = 2'd0;
+assign s_axi_hp0_awprot  = 3'd0;
+assign s_axi_hp0_awqos   = 4'd0;
+assign s_axi_hp0_awsize  = 3'd0;
+
+assign s_axi_hp0_wvalid  = 1'b0;
+assign s_axi_hp0_wdata   = 64'd0;
+assign s_axi_hp0_wid     = 6'd0;
+assign s_axi_hp0_wlast   = 1'b0;
+assign s_axi_hp0_wstrb   = 8'd0;
+
+assign s_axi_hp0_bready  = 1'b1;
+assign s_axi_hp0_rready  = 1'b1;
 
 axi_if u_axi_if (
     .clk  (fclk0),
