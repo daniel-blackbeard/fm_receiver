@@ -2,8 +2,10 @@
 #include <stddef.h>
 #include "eth0.h"
 
-/* Shared TX ring producer index -- every sender goes through
- * eth_tx_reserve()/commit() rather than touching descriptors directly. */
+/* Shared TX ring producer index, in FRAME units (each frame = 2
+ * descriptors at [tx_next*2, tx_next*2+1]) -- both single-buffer and
+ * scatter-gather senders draw from this same rotating pool (see the
+ * GEM_TX_RING_SIZE comment in eth0.h). */
 static uint32_t tx_next = 0u;
 
 /* RX ring consumer index, mirroring tx_next on the RX side. */
@@ -85,14 +87,25 @@ void gem_setup(void){
     GEM_SPEC_ADDR1_BOT = 0xADDE0002u;
     GEM_SPEC_ADDR1_TOP = 0x0000EFBEu;
 
-    /* Ring init: every slot starts USED=1 (dormant, safe) -- only armed
-     * for real via eth_tx_commit(). WRAP=1 only on the last slot. */
+    /* Ring init: GEM_TX_FRAME_SLOTS frames, 2 descriptors each -- both
+     * start USED=1 (dormant, safe), only armed for real via
+     * eth_tx_commit()/eth_tx_sg_commit(). Every slot is fully rewritten
+     * (both descriptors) on every commit regardless of sender, since any
+     * slot can hold a single-buffer frame's trailer one time and a
+     * sample-stream payload the next -- see the GEM_TX_RING_SIZE comment
+     * in eth0.h. WRAP=1 only on the true last physical descriptor. */
     {
         uint32_t i;
-        for (i = 0u; i < GEM_TX_RING_SIZE; i++) {
-            uint32_t wrap = (i == GEM_TX_RING_SIZE - 1u) ? (1u << 30) : 0u;
-            GEM_DESC_BUF(i)   = FRAME_BASE_ADDR + i * sizeof(eth_frame);
-            GEM_DESC_FLAGS(i) = (1u << 31) | wrap;
+        for (i = 0u; i < GEM_TX_FRAME_SLOTS; i++) {
+            uint32_t content_idx = i * 2u;
+            uint32_t trailer_idx = content_idx + 1u;
+            uint32_t trailer_wrap = (trailer_idx == GEM_TX_RING_SIZE - 1u) ? (1u << 30) : 0u;
+
+            GEM_DESC_BUF(content_idx)   = FRAME_BASE_ADDR + i * sizeof(eth_frame);
+            GEM_DESC_FLAGS(content_idx) = (1u << 31);
+
+            GEM_DESC_BUF(trailer_idx)   = FRAME_BASE_ADDR + i * sizeof(eth_frame);
+            GEM_DESC_FLAGS(trailer_idx) = (1u << 31) | trailer_wrap;
         }
     }
     /* Replicating the same structure for RX descriptor ring*/
@@ -147,28 +160,76 @@ uint32_t phy_get_link_status(void){
 }
 
 /*
- * Reserve the next TX slot. Returns a pointer to its buffer if GEM is
- * done with it (USED==1), or NULL if the ring is full. No blocking/retry
- * -- a full ring means dropping whatever didn't fit.
+ * Reserve the next TX frame slot. Returns a pointer to its content
+ * buffer if GEM is done with it (content descriptor's USED==1), or NULL
+ * if the ring is full (no blocking/retry -- a full ring drops the frame).
+ * Checking only the content descriptor is sufficient: hardware only ever
+ * reports completion there (UG585 Table 16-3), and both descriptors of a
+ * slot always move together.
  */
 void *eth_tx_reserve(void){
-    if (!(GEM_DESC_FLAGS(tx_next) & (1u << 31))) {
+    if (!(GEM_DESC_FLAGS(tx_next * 2u) & (1u << 31))) {
         return NULL;
     }
     return (void *)(FRAME_BASE_ADDR + tx_next * sizeof(eth_frame));
 }
 
 /*
- * Arm the slot from the last eth_tx_reserve() call with `len` bytes
- * already written, and kick GEM. WRAP is recomputed fresh rather than
- * preserved, avoiding a read-modify-write.
+ * Arm both descriptors of the slot from the last eth_tx_reserve() call
+ * and kick GEM. Trailer (zero-length, LAST=1) is written first, still
+ * safely dormant since GEM reaches the content descriptor first; the
+ * content descriptor's USED bit clears last, releasing the frame. Both
+ * descriptors are rewritten every time since this slot may have last
+ * held a sample-stream frame whose trailer pointed elsewhere.
  */
 void eth_tx_commit(uint16_t len){
-    uint32_t wrap = (tx_next == GEM_TX_RING_SIZE - 1u) ? (1u << 30) : 0u;
-    GEM_DESC_FLAGS(tx_next) = (0u << 31) | wrap | (1u << 15) | len;
-    __asm__ volatile ("dsb" ::: "memory"); /* descriptor write must reach DDR before GEM is kicked */
+    uint32_t content_idx = tx_next * 2u;
+    uint32_t trailer_idx = content_idx + 1u;
+    uint32_t trailer_wrap = (trailer_idx == GEM_TX_RING_SIZE - 1u) ? (1u << 30) : 0u;
+
+    GEM_DESC_BUF(trailer_idx)   = FRAME_BASE_ADDR + tx_next * sizeof(eth_frame); /* unused, 0-length */
+    GEM_DESC_FLAGS(trailer_idx) = (0u << 31) | trailer_wrap | (1u << 15) | 0u;
+
+    GEM_DESC_BUF(content_idx)   = FRAME_BASE_ADDR + tx_next * sizeof(eth_frame);
+    GEM_DESC_FLAGS(content_idx) = (0u << 31) | (0u << 15) | len; /* LAST=0: trailer completes the frame */
+
+    __asm__ volatile ("dsb" ::: "memory"); /* descriptor writes must reach DDR before GEM is kicked */
     GEM_NWCTRL = GEM_NWCTRL | (0x1u << 9);
-    tx_next = (tx_next + 1u) % GEM_TX_RING_SIZE;
+    tx_next = (tx_next + 1u) % GEM_TX_FRAME_SLOTS;
+}
+
+/*
+ * Reserve one scatter-gather frame slot -- shares tx_next/the same
+ * physical ring as eth_tx_reserve() (see the GEM_TX_RING_SIZE comment in
+ * eth0.h). Returns a buffer to build the Ethernet+IP+UDP header into
+ * (the payload itself is zero-copy), or NULL if the ring is full.
+ */
+void *eth_tx_sg_reserve(void){
+    if (!(GEM_DESC_FLAGS(tx_next * 2u) & (1u << 31))) {
+        return NULL;
+    }
+    return (void *)(FRAME_BASE_ADDR + tx_next * sizeof(eth_frame));
+}
+
+/*
+ * Arms both descriptors of the slot from the last eth_tx_sg_reserve()
+ * call and kicks GEM once, same ordering discipline as eth_tx_commit().
+ * `payload_addr` points directly at the real data -- never copied.
+ */
+void eth_tx_sg_commit(uint16_t hdr_len, uint32_t payload_addr, uint16_t payload_len){
+    uint32_t content_idx = tx_next * 2u;
+    uint32_t trailer_idx = content_idx + 1u;
+    uint32_t trailer_wrap = (trailer_idx == GEM_TX_RING_SIZE - 1u) ? (1u << 30) : 0u;
+
+    GEM_DESC_BUF(trailer_idx)   = payload_addr;
+    GEM_DESC_FLAGS(trailer_idx) = (0u << 31) | trailer_wrap | (1u << 15) | payload_len;
+
+    GEM_DESC_BUF(content_idx)   = FRAME_BASE_ADDR + tx_next * sizeof(eth_frame); /* header buffer */
+    GEM_DESC_FLAGS(content_idx) = (0u << 31) | (0u << 15) | hdr_len; /* LAST=0: trailer continues this frame */
+
+    __asm__ volatile ("dsb" ::: "memory"); /* both descriptors must reach DDR before GEM is kicked */
+    GEM_NWCTRL = GEM_NWCTRL | (0x1u << 9);
+    tx_next = (tx_next + 1u) % GEM_TX_FRAME_SLOTS;
 }
 
 void eth_send_test_frame(void){
@@ -378,4 +439,81 @@ void eth_udp_reply_commit(uint16_t payload_len)
     }
 
     eth_tx_commit(total_frame_len);
+}
+
+/*
+ * Build and send one sample-stream packet: Ethernet+IP+UDP header,
+ * broadcast Ethernet destination (no ARP client to resolve the PC's real
+ * MAC), followed by a payload descriptor pointing directly at
+ * `payload_addr` -- never copied. No padding-to-minimum needed here: a
+ * sample packet's payload is always >=1KB. Returns 0 on success, nonzero
+ * if the SG ring is full.
+ */
+uint8_t eth_send_sample_packet(uint32_t payload_addr, uint16_t payload_len)
+{
+    uint8_t *buf = (uint8_t *)eth_tx_sg_reserve();
+    uint16_t ip_total_len;
+    uint16_t udp_len;
+    uint16_t checksum;
+    uint32_t i;
+
+    if (buf == NULL) {
+        return 1u;
+    }
+
+    for (i = 0u; i < 6u; i++) { buf[i] = 0xFFu; }               /* dest MAC: broadcast, see header comment */
+    for (i = 0u; i < 6u; i++) { buf[6u + i] = g_board_mac[i]; } /* src MAC = board */
+    buf[12] = 0x08u; buf[13] = 0x00u;                            /* EtherType = IPv4 */
+
+    ip_total_len = (uint16_t)(20u + 8u + payload_len);
+    udp_len      = (uint16_t)(8u + payload_len);
+
+    buf[14] = 0x45u; /* version 4, IHL 5 (20-byte header, no options) */
+    buf[15] = 0x00u; /* DSCP/ECN */
+    buf[16] = (uint8_t)(ip_total_len >> 8); buf[17] = (uint8_t)ip_total_len;
+    buf[18] = 0x00u; buf[19] = 0x00u; /* identification -- unfragmented, 0 is fine */
+    buf[20] = 0x00u; buf[21] = 0x00u; /* flags/fragment offset */
+    buf[22] = 64u;   /* TTL */
+    buf[23] = 17u;   /* protocol = UDP */
+    buf[24] = 0x00u; buf[25] = 0x00u; /* header checksum -- filled in below */
+    buf[26] = BOARD_IP0; buf[27] = BOARD_IP1; buf[28] = BOARD_IP2; buf[29] = BOARD_IP3; /* src IP */
+    buf[30] = SAMPLE_DEST_IP0; buf[31] = SAMPLE_DEST_IP1;
+    buf[32] = SAMPLE_DEST_IP2; buf[33] = SAMPLE_DEST_IP3; /* dest IP */
+
+    buf[34] = (uint8_t)(SAMPLE_DEST_PORT >> 8); buf[35] = (uint8_t)SAMPLE_DEST_PORT; /* src port */
+    buf[36] = (uint8_t)(SAMPLE_DEST_PORT >> 8); buf[37] = (uint8_t)SAMPLE_DEST_PORT; /* dest port */
+    buf[38] = (uint8_t)(udp_len >> 8); buf[39] = (uint8_t)udp_len;
+    buf[40] = 0x00u; buf[41] = 0x00u; /* UDP checksum = 0 (optional, per roadmap) */
+
+    checksum = ip_checksum(buf + 14, 20u);
+    buf[24] = (uint8_t)(checksum >> 8); buf[25] = (uint8_t)checksum;
+
+    eth_tx_sg_commit(ETH_UDP_HEADER_LEN, payload_addr, payload_len);
+    return 0u;
+}
+
+/*
+ * Checks axi_notifications' register 0 for a new sample-stream batch and,
+ * if ready, sends it via eth_send_sample_packet() -- zero-copy, straight
+ * from wherever axi_dsp wrote it. Acks unconditionally once handled, even
+ * if the SG ring was full and the send got dropped: packet loss when PS
+ * falls behind is an accepted risk, and leaving the ready bit set would
+ * just stall axi_dsp's PL-side bookkeeping instead of helping.
+ */
+void eth_poll_sample_stream(void)
+{
+    uint32_t status = REG_SAMPLE_NOTIF;
+    uint32_t index;
+    uint32_t payload_addr;
+
+    if (!(status & NOTIF_READY_MASK)) {
+        return;
+    }
+
+    index        = (status & NOTIF_INDEX_MASK) >> NOTIF_INDEX_SHIFT;
+    payload_addr = SAMPLE_STREAM_BASE + index * SAMPLE_STREAM_NOTIF_BYTES;
+
+    (void)eth_send_sample_packet(payload_addr, (uint16_t)SAMPLE_STREAM_NOTIF_BYTES);
+
+    REG_SAMPLE_NOTIF = status & ~NOTIF_READY_MASK;
 }

@@ -175,6 +175,50 @@ _start:
     subs    r2, r2, #1
     bne     2b
 
+    @ Override one 1MB section (0x02000000-0x020FFFFF) to Strongly
+    @ Ordered: the axi_dsp/GEM sample-streaming DDR region (see
+    @ private/sample_streaming_plan.md). Only affects how the ARM core
+    @ accesses the region -- axi_dsp's S_AXI_HP0 writes and GEM's DMA
+    @ reads bypass the MMU/cache entirely either way. Firmware never
+    @ bulk-copies this payload, so losing cache burst merging here costs
+    @ nothing and removes a whole class of D-cache coherency bugs.
+    ldr     r0, =mmu_table
+    add     r0, r0, #(32 * 4)         @ section index 32 = 0x02000000 >> 20
+    ldr     r4, =0xC02                @ Strongly Ordered, AP=11, Domain 0, Section
+    ldr     r1, =0x02000000
+    orr     r3, r1, r4
+    str     r3, [r0]
+
+    @ Same override, applied to GEM's own descriptor rings and frame
+    @ buffers (0x00800000 TX descriptors, 0x00900000 RX descriptors,
+    @ 0x01000000 TX/RX frame buffers -- eth0.h's GEM_DESCRIPTOR_TX/RX and
+    @ FRAME_BASE_ADDR). GEM reads these directly from DDR, bypassing the
+    @ D-cache, so a descriptor firmware just wrote could sit dirty in
+    @ cache while GEM read stale content from DDR. Different problem from
+    @ why D-cache itself is enabled project-wide (SCTLR.C below fixes an
+    @ uncached *stack*; this is a *cached* region a non-coherent DMA
+    @ peripheral also touches) -- both fixes are real and both stay.
+    ldr     r0, =mmu_table
+    add     r0, r0, #(8 * 4)          @ section index 8 = 0x00800000 >> 20
+    ldr     r4, =0xC02
+    ldr     r1, =0x00800000
+    orr     r3, r1, r4
+    str     r3, [r0]
+
+    ldr     r0, =mmu_table
+    add     r0, r0, #(9 * 4)          @ section index 9 = 0x00900000 >> 20
+    ldr     r4, =0xC02
+    ldr     r1, =0x00900000
+    orr     r3, r1, r4
+    str     r3, [r0]
+
+    ldr     r0, =mmu_table
+    add     r0, r0, #(16 * 4)         @ section index 16 = 0x01000000 >> 20
+    ldr     r4, =0xC02
+    ldr     r1, =0x01000000
+    orr     r3, r1, r4
+    str     r3, [r0]
+
     ldr     r0, =mmu_table
     mcr     p15, 0, r0, c2, c0, 0     @ TTBR0 = table base
 
@@ -186,6 +230,17 @@ _start:
                                       @ enabling it
 
     mrc     p15, 0, r0, c1, c0, 0     @ SCTLR
+    orr     r0, r0, #(1 << 2)         @ C (bit 2) -- data cache explicitly
+                                      @ SET, not just left as whatever a
+                                      @ JTAG warm reset (rst -processor)
+                                      @ happened to leave it at -- that
+                                      @ reset doesn't reliably restore
+                                      @ coprocessor state to its true
+                                      @ power-on default, so this bit needs
+                                      @ to be forced deterministic here,
+                                      @ not assumed. EXPERIMENTAL: bisecting
+                                      @ whether an uncached DDR stack is
+                                      @ the crash trigger.
     orr     r0, r0, #1                @ M (bit 0) -- MMU enable
     orr     r0, r0, #(1 << 12)        @ I (bit 12) -- instruction cache
                                       @ enable

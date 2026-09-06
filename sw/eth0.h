@@ -39,23 +39,79 @@
 #define GEM_DESCRIPTOR_RX  0x00900000u  /* GEM0 TX descriptor ring base */
 #define FRAME_BASE_ADDR    0x01000000u  /* first of GEM_TX_RING_SIZE per-slot buffers */
 
-/* TX ring: GEM_TX_RING_SIZE descriptors, 8 bytes each (word0=buffer
- * address, word1=control/flags), contiguous from GEM_DESCRIPTOR. Slot i's
- * buffer lives at FRAME_BASE_ADDR + i*sizeof(eth_frame). */
-#define GEM_TX_RING_SIZE 64u
+/*
+ * TX ring: GEM_TX_RING_SIZE physical descriptors, 8 bytes each
+ * (word0=buffer address, word1=control/flags), contiguous from
+ * GEM_DESCRIPTOR_TX. Every frame -- test frame, ARP reply, UDP command
+ * reply, and zero-copy sample-stream packets -- always consumes exactly
+ * 2 consecutive descriptors: a "content" descriptor (LAST=0) followed by
+ * a "trailer" descriptor (LAST=1, zero-length filler or the real
+ * sample-stream payload pointed at directly). GEM_TX_RING_SIZE/2 =
+ * GEM_TX_FRAME_SLOTS is the real usable frame count, all sharing one
+ * producer index (tx_next, in eth0.c).
+ *
+ * Uniform 2-descriptor occupancy is load-bearing: hardware only sets the
+ * USED bit back on a frame's *first* descriptor (UG585 Table 16-3), so a
+ * ring mixing 1- and 2-descriptor allocations can't reliably tell a
+ * "second descriptor" slot is free; and GEM walks the ring strictly
+ * sequentially with no way to skip a dormant region, so a separate,
+ * rarely-used ring for sample-stream traffic can permanently stall GEM's
+ * queue pointer the first time it reaches it. See
+ * private/sample_streaming_plan.md for the full history.
+ */
+#define GEM_TX_RING_SIZE   64u                    /* physical descriptor count */
+#define GEM_TX_FRAME_SLOTS (GEM_TX_RING_SIZE / 2u) /* usable frames -- 2 descriptors each */
 #define GEM_RX_RING_SIZE 8u
 #define GEM_DESC_BUF(i)   (*(volatile uint32_t *) (GEM_DESCRIPTOR_TX + (uint32_t)(i) * 8u))
 #define GEM_DESC_FLAGS(i) (*(volatile uint32_t *) (GEM_DESCRIPTOR_TX + (uint32_t)(i) * 8u + 4u))
 #define GEM_DESC_BUF_RX(i)   (*(volatile uint32_t *) (GEM_DESCRIPTOR_RX + (uint32_t)(i) * 8u))
 #define GEM_DESC_FLAGS_RX(i) (*(volatile uint32_t *) (GEM_DESCRIPTOR_RX + (uint32_t)(i) * 8u + 4u))
 
-/* First of GEM_RX_RING_SIZE per-slot RX buffers, right after the TX
- * buffer region. Named (not inlined) so gem_setup()'s ring-init loop and
- * eth_rx_poll()/eth_rx_release() can't drift apart on the same value. */
-#define GEM_RX_BUF_BASE (FRAME_BASE_ADDR + 64u * sizeof(eth_frame))
+/* First of GEM_TX_FRAME_SLOTS per-slot buffers, right after the TX
+ * descriptor ring. Named (not inlined) so gem_setup()'s ring-init loop
+ * and eth_rx_poll()/eth_rx_release() can't drift apart on the same
+ * value. Slot i's buffer lives at FRAME_BASE_ADDR + i*sizeof(eth_frame)
+ * -- shared by every sender (test frame, ARP reply, UDP reply, and the
+ * sample-stream header) regardless of who's using frame slot i this
+ * time; only the sample-stream payload itself is ever zero-copy (its
+ * descriptor points directly into SAMPLE_STREAM_BASE instead). */
+#define GEM_RX_BUF_BASE (FRAME_BASE_ADDR + GEM_TX_FRAME_SLOTS * sizeof(eth_frame))
 /* Real 1518-byte Ethernet MTU (rounded up), not a small placeholder --
  * keeps one frame within one RX descriptor. */
 #define GEM_RX_BUF_STRIDE 1536u
+
+/*
+ * PL sample-streaming buffer (axi_dsp -> DDR -> ETH0), see
+ * private/sample_streaming_plan.md for the full design. A 1MB circular
+ * buffer axi_dsp fills via S_AXI_HP0; firmware never writes or copies
+ * it, only reads the notification register below and points a TX
+ * descriptor at the right offset (zero-copy). Marked Strongly Ordered
+ * in startup.S's MMU table so no cache maintenance is needed.
+ */
+#define SAMPLE_STREAM_BASE        0x02000000u
+#define SAMPLE_STREAM_SIZE        0x00100000u /* 1 MByte */
+/* One notification = 8 AXI bursts x 128 bytes/burst (axi_dsp.sv's
+ * BANK_SAMPLES x 8 bytes/beat), confirmed to divide SAMPLE_STREAM_SIZE
+ * evenly (1MB / 1KB = 1024 exactly) -- a notification never straddles
+ * the circular buffer's wrap point, by construction. */
+#define SAMPLE_STREAM_NOTIF_BYTES 1024u
+#define SAMPLE_STREAM_NOTIF_COUNT (SAMPLE_STREAM_SIZE / SAMPLE_STREAM_NOTIF_BYTES) /* 1024 */
+
+/*
+ * axi_notifications (PERIPH_ID 0x04): PL-to-PS status regmap, see
+ * src/axi_notifications.sv's header comment. Register 0 is axi_dsp's
+ * notification word -- bit0 (NOTIF_READY_MASK) is set by PL when a new
+ * 1KB slice has landed, bits[10:1] (NOTIF_INDEX_MASK) are which slice
+ * (SAMPLE_STREAM_BASE + index*SAMPLE_STREAM_NOTIF_BYTES); firmware acks
+ * by writing the register back with bit0 cleared (plain read-modify-
+ * write, per the agreed PL-always-wins collision priority). Registers
+ * 1-3 are spare for future PL-side status.
+ */
+#define NOTIF_AXI_BASE (0x40000000u | (0x04u << 16)) /* GP0 base | axi_notifications' PERIPH_ID */
+#define REG_SAMPLE_NOTIF (*(volatile uint32_t *)(NOTIF_AXI_BASE + 0x00u))
+#define NOTIF_READY_MASK  0x00000001u
+#define NOTIF_INDEX_MASK  0x000007FEu /* bits [10:1] */
+#define NOTIF_INDEX_SHIFT 1u
 
 /* Board identity for the UDP command protocol -- MAC matches
  * GEM_SPEC_ADDR1_BOT/TOP in gem_setup() (02:00:de:ad:be:ef). Fixed, no
@@ -65,6 +121,18 @@
 #define BOARD_IP2 3u
 #define BOARD_IP3 50u
 #define UDP_CMD_PORT 5555u
+
+/* Sample-stream destination -- static, matching this project's
+ * no-DHCP/no-dynamic-ARP-resolution approach (same spirit as BOARD_IP*
+ * above). Ethernet destination itself is broadcast (see
+ * eth_send_sample_packet()) since this stack has no ARP client, only a
+ * responder. Distinct port from UDP_CMD_PORT so sample traffic never
+ * blocks behind the command console. */
+#define SAMPLE_DEST_IP0  192u
+#define SAMPLE_DEST_IP1  168u
+#define SAMPLE_DEST_IP2  3u
+#define SAMPLE_DEST_IP3  9u
+#define SAMPLE_DEST_PORT 5556u
 
 /* Ethernet minimum frame size (source bytes, before the 4-byte FCS GEM
  * appends itself) -- GEM does NOT auto-pad short TX frames, so anything
@@ -89,6 +157,27 @@ uint32_t phy_get_link_status(void);
 void *eth_tx_reserve(void);
 void eth_tx_commit(uint16_t len);
 void eth_send_test_frame(void);
+
+/* Scatter-gather TX for zero-copy sample-stream sends -- shares the same
+ * ring/producer index as eth_tx_reserve()/eth_tx_commit() (see the
+ * GEM_TX_RING_SIZE comment in this header for why that sharing is safe).
+ * reserve() returns a buffer to build the Ethernet+IP+UDP header into (or
+ * NULL if the ring is full); commit() arms both descriptors and kicks
+ * GEM once, with `payload_addr` pointing directly at the real data. */
+void *eth_tx_sg_reserve(void);
+void eth_tx_sg_commit(uint16_t hdr_len, uint32_t payload_addr, uint16_t payload_len);
+
+/* Builds the Ethernet+IP+UDP header for one sample-stream packet and
+ * sends it via the scatter-gather path, with `payload_addr`/
+ * `payload_len` describing the real sample data (zero-copy, never
+ * touched here). Returns 0 on success, nonzero if the ring is full. */
+uint8_t eth_send_sample_packet(uint32_t payload_addr, uint16_t payload_len);
+
+/* Checks axi_notifications for a new sample-stream batch and sends it if
+ * one is ready, acking unconditionally once handled (see eth0.c for the
+ * full reasoning). Call once per main-loop iteration, same cadence as
+ * eth_service(). */
+void eth_poll_sample_stream(void);
 
 /* RX ring consumer, mirroring eth_tx_reserve()/eth_tx_commit(): poll
  * returns a pointer to the current RX slot's buffer and length if a frame

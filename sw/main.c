@@ -157,6 +157,7 @@ static uint8_t uart1_getc(void)
 #define CMD_DEV_SLCR 0x18u
 #define CMD_DEV_DESC_RX 0x1Cu
 #define CMD_DEV_RXBUF   0x20u
+#define CMD_DEV_NOTIF   0x24u
 #define CMD_RW_WRITE (1u << 0)
 
 /*
@@ -616,6 +617,16 @@ static uint8_t dispatch_command(const uint8_t *req, uint32_t *reply)
             *reply = *reg;
             has_reply = 1u;
         }
+    } else if (dev == CMD_DEV_NOTIF) {
+        /* axi_notifications: raw register peek for debugging --
+         * eth_poll_sample_stream() is the real consumer. Writes ignored
+         * (same pattern as CMD_DEV_CDC). */
+        if (!(rw & CMD_RW_WRITE)) {
+            if (addr & 0x3u) { return 0u; }
+            volatile uint32_t *reg = (volatile uint32_t *)(NOTIF_AXI_BASE + addr);
+            *reply = *reg;
+            has_reply = 1u;
+        }
     } else if (dev == CMD_DEV_SYS) {
         if (rw & CMD_RW_WRITE) {
             uint8_t mode = (uint8_t)(data & 0xFFu);
@@ -795,11 +806,14 @@ void main(void)
 
     /* Service whichever of UART/Ethernet has work each pass, forever.
      * uart1_available() is non-blocking so a missing UART byte can't
-     * starve eth_service(). */
+     * starve eth_service(). eth_poll_sample_stream() is a cheap register
+     * check when axi_dsp has nothing new, so it costs nothing to poll
+     * every iteration alongside the others. */
     for (;;) {
         if (uart1_available()) {
             process_uart_command();
         }
         eth_service();
+        eth_poll_sample_stream();
     }
 }

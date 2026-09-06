@@ -56,6 +56,9 @@ wire         fclk0_rstn;   // active-low; unused for now — free-running counte
 logic        dsp_clk;      // ad3961_if_rx's recovered RX clock -- declared here (rather than
                             // down by its instantiation) so it's available to axi_cdc_status,
                             // instantiated earlier in the file
+logic [15:0] data_rx0_i, data_rx0_q, data_rx1_i, data_rx1_q; // decimated I/Q, see "Glue logic" below --
+                            // declared here so axi_dsp's instantiation (earlier in the file) can use them
+logic        dec_done;      // decimation-stage pulse, same forward-declaration reasoning as above
 
 // M_AXI_GP0 — PS7's AXI3 master into the PL. Internal wires, not top-level
 // ports: this bus never leaves the chip. It goes straight into axi_if
@@ -202,11 +205,18 @@ wire        cdc_rdone;
 wire [31:0] cdc_rdata;
 wire        cdc_rnoaddr;
 
-assign p_wdone   = regs_wdone   | spi_wdone   | cdc_wdone;
-assign p_wnoaddr = regs_wnoaddr & spi_wnoaddr & cdc_wnoaddr;
-assign p_rdone   = regs_rdone   | spi_rdone   | cdc_rdone;
-assign p_rnoaddr = regs_rnoaddr & spi_rnoaddr & cdc_rnoaddr;
-assign p_rdata   = regs_rdone ? regs_rdata : (spi_rdone ? spi_rdata : cdc_rdata);
+// axi_notifications (PERIPH_ID 8'h04)
+wire        notif_wdone;
+wire        notif_wnoaddr;
+wire        notif_rdone;
+wire [31:0] notif_rdata;
+wire        notif_rnoaddr;
+
+assign p_wdone   = regs_wdone   | spi_wdone   | cdc_wdone   | notif_wdone;
+assign p_wnoaddr = regs_wnoaddr & spi_wnoaddr & cdc_wnoaddr & notif_wnoaddr;
+assign p_rdone   = regs_rdone   | spi_rdone   | cdc_rdone   | notif_rdone;
+assign p_rnoaddr = regs_rnoaddr & spi_rnoaddr & cdc_rnoaddr & notif_rnoaddr;
+assign p_rdata   = regs_rdone ? regs_rdata : (spi_rdone ? spi_rdata : (cdc_rdone ? cdc_rdata : notif_rdata));
 
 wire [255:0] regmap;
 wire         blink_en;
@@ -345,18 +355,8 @@ design_1_wrapper ps_u (
     .s_axi_hp0_wvalid  (s_axi_hp0_wvalid)
 );
 
-// S_AXI_HP0 placeholder tie-offs -- PS7 is the AXI slave on this port, so
-// every master-role signal (everything below except the three *ready
-// inputs, which are legitimately driven by a real master when one
-// exists) needs to be driven by something right now, or these are
-// floating inputs into a hard IP block, not just unused RTL. All held at
-// a safe idle (every *valid low, so PS7 never even samples the
-// don't-care address/data fields; *ready held ready so nothing on the
-// PS7 side ever blocks waiting for us -- moot today since nothing
-// asserts *valid to it anyway, but this way it stays correct advice for
-// a partial one-direction master later, not just a placeholder that
-// happens to work). Delete this whole block once the real RX-sample-to-
-// DDR streaming master exists and drives these signals directly.
+// S_AXI_HP0 read channel: axi_dsp is write-only, PL never reads back
+// what it streams out, so tie off AR/R permanently.
 assign s_axi_hp0_arvalid = 1'b0;
 assign s_axi_hp0_araddr  = 32'd0;
 assign s_axi_hp0_arburst = 2'd0;
@@ -367,26 +367,80 @@ assign s_axi_hp0_arlock  = 2'd0;
 assign s_axi_hp0_arprot  = 3'd0;
 assign s_axi_hp0_arqos   = 4'd0;
 assign s_axi_hp0_arsize  = 3'd0;
-
-assign s_axi_hp0_awvalid = 1'b0;
-assign s_axi_hp0_awaddr  = 32'd0;
-assign s_axi_hp0_awburst = 2'd0;
-assign s_axi_hp0_awcache = 4'd0;
-assign s_axi_hp0_awid    = 6'd0;
-assign s_axi_hp0_awlen   = 4'd0;
-assign s_axi_hp0_awlock  = 2'd0;
-assign s_axi_hp0_awprot  = 3'd0;
-assign s_axi_hp0_awqos   = 4'd0;
-assign s_axi_hp0_awsize  = 3'd0;
-
-assign s_axi_hp0_wvalid  = 1'b0;
-assign s_axi_hp0_wdata   = 64'd0;
-assign s_axi_hp0_wid     = 6'd0;
-assign s_axi_hp0_wlast   = 1'b0;
-assign s_axi_hp0_wstrb   = 8'd0;
-
-assign s_axi_hp0_bready  = 1'b1;
 assign s_axi_hp0_rready  = 1'b1;
+
+// axi_dsp: the DSP-sample-to-DDR streaming master, driving S_AXI_HP0 and
+// axi_notifications' PL write port.
+wire [31:0] axi_dsp_pl_update;
+wire [1:0]  axi_dsp_pl_index;
+wire        axi_dsp_pl_wen;
+wire [1:0]  axi_dsp_dbg_state;
+wire        axi_dsp_dbg_pending;
+wire        axi_dsp_dbg_trigger;
+wire        axi_dsp_dbg_drain_bank;
+wire [19:0] axi_dsp_dbg_wr_offset;
+
+// dsp_clk-domain reset synchronizer for axi_dsp's rstb_dsp: fclk0_rstn
+// crossed into dsp_clk via async-assert/sync-release (asserts immediately,
+// releases after 2 dsp_clk cycles so the release edge can't cause
+// metastability downstream).
+logic rstb_dsp_meta, rstb_dsp_sync;
+always_ff @(posedge dsp_clk or negedge fclk0_rstn) begin
+    if (!fclk0_rstn) begin
+        rstb_dsp_meta <= 1'b0;
+        rstb_dsp_sync <= 1'b0;
+    end else begin
+        rstb_dsp_meta <= 1'b1;
+        rstb_dsp_sync <= rstb_dsp_meta;
+    end
+end
+
+axi_dsp u_axi_dsp (
+    .clk_fpga  (fclk0),
+    .clk_dsp   (dsp_clk),
+    .rstb_dsp  (rstb_dsp_sync),
+    .rstb_fpga (fclk0_rstn),
+
+    .i_valid (dec_done),           // placeholder -- no real DSP sample pipeline feeds this yet
+    .ch0_i (data_rx0_i),            // placeholder -- real RX0 I data not wired yet
+    .ch0_q (data_rx0_q),            // placeholder -- real RX0 Q data not wired yet
+    .ch1_i (data_rx1_i),            // placeholder -- real RX1 I data not wired yet
+    .ch1_q (data_rx1_q),            // placeholder -- real RX1 Q data not wired yet
+
+    .awid    (s_axi_hp0_awid),
+    .awaddr  (s_axi_hp0_awaddr),
+    .awlen   (s_axi_hp0_awlen),
+    .awsize  (s_axi_hp0_awsize),
+    .awburst (s_axi_hp0_awburst),
+    .awlock  (s_axi_hp0_awlock),
+    .awcache (s_axi_hp0_awcache),
+    .awprot  (s_axi_hp0_awprot),
+    .awqos   (s_axi_hp0_awqos),
+    .awvalid (s_axi_hp0_awvalid),
+    .awready (s_axi_hp0_awready),
+
+    .wid     (s_axi_hp0_wid),
+    .wdata   (s_axi_hp0_wdata),
+    .wstrb   (s_axi_hp0_wstrb),
+    .wlast   (s_axi_hp0_wlast),
+    .wvalid  (s_axi_hp0_wvalid),
+    .wready  (s_axi_hp0_wready),
+
+    .bid     (s_axi_hp0_bid),
+    .bresp   (s_axi_hp0_bresp),
+    .bvalid  (s_axi_hp0_bvalid),
+    .bready  (s_axi_hp0_bready),
+
+    .pl_update (axi_dsp_pl_update),
+    .pl_index  (axi_dsp_pl_index),
+    .pl_wen    (axi_dsp_pl_wen),
+
+    .dbg_state      (axi_dsp_dbg_state),
+    .dbg_pending    (axi_dsp_dbg_pending),
+    .dbg_trigger    (axi_dsp_dbg_trigger),
+    .dbg_drain_bank (axi_dsp_dbg_drain_bank),
+    .dbg_wr_offset  (axi_dsp_dbg_wr_offset)
+);
 
 axi_if u_axi_if (
     .clk  (fclk0),
@@ -542,6 +596,86 @@ axi_cdc_status #(
     .dsp_reg_out (cdc_dsp_reg_out)
 );
 
+// Debug tap: sticky "ever seen since boot" bits for S_AXI_HP0's write
+// handshake, mirrored into axi_notifications register 1 (spare). Kept
+// for bring-up visibility.
+logic seen_awvalid, seen_awready, seen_wvalid, seen_wready, seen_bvalid, seen_bready;
+always_ff @(posedge fclk0 or negedge fclk0_rstn) begin
+    if (!fclk0_rstn) begin
+        seen_awvalid <= 1'b0;
+        seen_awready <= 1'b0;
+        seen_wvalid  <= 1'b0;
+        seen_wready  <= 1'b0;
+        seen_bvalid  <= 1'b0;
+        seen_bready  <= 1'b0;
+    end else begin
+        if (s_axi_hp0_awvalid) seen_awvalid <= 1'b1;
+        if (s_axi_hp0_awready) seen_awready <= 1'b1;
+        if (s_axi_hp0_wvalid)  seen_wvalid  <= 1'b1;
+        if (s_axi_hp0_wready)  seen_wready  <= 1'b1;
+        if (s_axi_hp0_bvalid)  seen_bvalid  <= 1'b1;
+        if (s_axi_hp0_bready)  seen_bready  <= 1'b1;
+    end
+end
+
+wire [31:0] dbg_hp0_status = {26'b0, seen_bready, seen_bvalid, seen_wready, seen_wvalid, seen_awready, seen_awvalid};
+
+// Second half of the debug tap: axi_dsp's internal FSM/bookkeeping state
+// (register 2, spare). trigger is sticky since it's a single-cycle pulse
+// that an async UART read would otherwise almost never catch live.
+logic seen_trigger;
+always_ff @(posedge fclk0 or negedge fclk0_rstn) begin
+    if (!fclk0_rstn) seen_trigger <= 1'b0;
+    else if (axi_dsp_dbg_trigger) seen_trigger <= 1'b1;
+end
+
+wire [31:0] dbg_axi_dsp_status = {7'b0, axi_dsp_dbg_wr_offset, axi_dsp_dbg_drain_bank,
+                                   seen_trigger, axi_dsp_dbg_pending, axi_dsp_dbg_state};
+
+// Debug taps share axi_notifications' single PL write port with axi_dsp's
+// real notification: axi_dsp's write (register 0) takes unconditional
+// priority when it fires; otherwise registers 1/2 alternate each cycle.
+logic dbg_toggle;
+always_ff @(posedge fclk0 or negedge fclk0_rstn) begin
+    if (!fclk0_rstn) dbg_toggle <= 1'b0;
+    else              dbg_toggle <= ~dbg_toggle;
+end
+
+wire        notif_pl_wen_muxed   = 1'b1;
+wire [1:0]  notif_pl_index_muxed = axi_dsp_pl_wen ? axi_dsp_pl_index : (dbg_toggle ? 2'd2 : 2'd1);
+wire [31:0] notif_pl_data_muxed  = axi_dsp_pl_wen ? axi_dsp_pl_update
+                                    : (dbg_toggle ? dbg_axi_dsp_status : dbg_hp0_status);
+
+// axi_notifications: PL-to-PS status regmap (see
+// src/axi_notifications.sv and private/sample_streaming_plan.md).
+wire [127:0] notif_reg_out;
+
+axi_notifications #(
+    .PERIPH_ID (8'h04)
+) u_axi_notifications (
+    .clk  (fclk0),
+    .rstb (fclk0_rstn),
+
+    .wen    (p_wen),
+    .w_addr (p_waddr),
+    .w_data (p_wdata),
+    .w_strb (p_wstrb),
+    .w_done (notif_wdone),
+    .w_no_addr (notif_wnoaddr),
+
+    .ren    (p_ren),
+    .r_addr (p_raddr),
+    .r_done (notif_rdone),
+    .r_data (notif_rdata),
+    .r_no_addr (notif_rnoaddr),
+
+    .pl_wen    (notif_pl_wen_muxed),
+    .pl_windex (notif_pl_index_muxed),
+    .pl_wdata  (notif_pl_data_muxed),
+
+    .reg_out (notif_reg_out)
+);
+
 // AD9361 RX digital interface -- ad3961_if_rx's own recovered RX clock
 // (looped in from rx_clk_in_p/n) and decoded ADC samples. Nothing
 // downstream consumes these yet (no DSP chain built) -- wired through
@@ -589,6 +723,30 @@ ad3961_if_rx u_ad3961_if_rx (
     .dbg_rx_data     (dbg_rx_data),
     .dbg_rx_frame_s  (dbg_rx_frame_s)
 );
+
+// Glue logic: decimation stage x8 (declarations moved up to axi_dsp's
+// own declaration block above -- same reasoning as dsp_clk's forward
+// declaration: xvlog requires declare-before-use even across a module
+// instantiation's port map, not just within a single always_ff block;
+// synth_design tolerates the original order fine, xvlog doesn't)
+logic  [2:0] dec_counter;
+
+always_ff @( posedge dsp_clk ) begin
+    dec_counter <= dec_counter + 3'b1;
+    if(dec_done) begin
+        data_rx0_i <= adc_data_i1;
+        data_rx0_q <= adc_data_q1;
+        data_rx1_i <= adc_data_i2;
+        data_rx1_q <= adc_data_q2;
+    end else begin
+        data_rx0_i <= data_rx0_i + adc_data_i1;
+        data_rx0_q <= data_rx0_q + adc_data_q1;
+        data_rx1_i <= data_rx1_i + adc_data_i2;
+        data_rx1_q <= data_rx1_q + adc_data_q2;
+    end
+end
+
+assign dec_done = dec_counter == 3'b0;
 
 assign gpio_3p3_2 = adc_status;
 
