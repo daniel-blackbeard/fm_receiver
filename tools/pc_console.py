@@ -35,6 +35,22 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
+import numpy as np
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+# Reuse the sample-stream receiver/unpacking logic verbatim rather than
+# duplicating it -- see sample_stream_view.py's own docstring for the full
+# wire-format derivation (AXI byte-lane mapping -> per-sample field order).
+# Binds a *different* UDP port (SAMPLE_PORT=5556) than this console's own
+# command socket (which never binds at all, just sends from an ephemeral
+# port and reads the reply back on it) -- the two can't collide, and
+# sample_stream_view.py can still be run standalone alongside this tab, or
+# instead of it, freely.
+from sample_stream_view import (
+    SampleReceiver, CHANNEL_NAMES, SAMPLE_PORT, SAMPLE_RATE_HZ, DEFAULT_FFT_SIZE,
+)
+
 # --- Protocol constants (mirrors sw/eth0.h / sw/main.c exactly) -----------
 
 BOARD_IP = "192.168.3.50"
@@ -132,11 +148,16 @@ class ConsoleApp:
 
         self.console_tab = ttk.Frame(notebook)
         self.regmap_tab = ttk.Frame(notebook)
+        self.sample_tab = ttk.Frame(notebook)
         notebook.add(self.console_tab, text="Command Console")
         notebook.add(self.regmap_tab, text="AXI Regmap")
+        notebook.add(self.sample_tab, text="RX Sample Stream (FFT)")
 
         self._build_console_tab()
         self._build_regmap_tab()
+        self._build_sample_tab()
+
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------------
     def _build_console_tab(self):
@@ -257,6 +278,116 @@ class ConsoleApp:
             for fv, mask, shift in entry["fields"]:
                 fv.set(str((value >> shift) & mask))
 
+    # ------------------------------------------------------------------
+    def _build_sample_tab(self):
+        f = self.sample_tab
+        self.sample_recv = None       # SampleReceiver, only while listening
+        self.sample_after_id = None   # root.after() handle for the redraw loop
+
+        ctrl = ttk.Frame(f)
+        ctrl.pack(fill="x", padx=8, pady=8)
+        self.sample_status_var = tk.StringVar(value="Not listening")
+        ttk.Label(ctrl, textvariable=self.sample_status_var).pack(side="left")
+        self.sample_toggle_btn = ttk.Button(ctrl, text="Start listening", command=self._toggle_sample_stream)
+        self.sample_toggle_btn.pack(side="right")
+
+        # Editable sample rate driving the FFT frequency axis, defaulting
+        # to the current hardware-measured decimated rate (SAMPLE_RATE_HZ,
+        # from sample_stream_view.py -- see its own comment for how that
+        # figure was derived). Not read from the board; purely a display
+        # setting, so it's safe to change freely if the decimation ratio
+        # or clk_dsp ever changes.
+        self.sample_rate_hz = SAMPLE_RATE_HZ
+        ttk.Label(ctrl, text="Sample rate (Hz):").pack(side="left", padx=(16, 4))
+        self.sample_rate_var = tk.StringVar(value=f"{SAMPLE_RATE_HZ:.0f}")
+        rate_entry = ttk.Entry(ctrl, textvariable=self.sample_rate_var, width=12)
+        rate_entry.pack(side="left")
+        rate_entry.bind("<Return>", self._on_sample_rate_change)
+        rate_entry.bind("<FocusOut>", self._on_sample_rate_change)
+
+        fig = Figure(figsize=(9, 6))
+        axes = fig.subplots(2, 2)
+        self.sample_freqs_mhz = np.fft.rfftfreq(DEFAULT_FFT_SIZE, d=1.0 / SAMPLE_RATE_HZ) / 1e6
+        self.sample_window = np.hanning(DEFAULT_FFT_SIZE)
+        self.sample_axes = axes
+        self.sample_lines = {}
+        for ax, name in zip(axes.flat, CHANNEL_NAMES):
+            (line,) = ax.plot(self.sample_freqs_mhz, np.zeros_like(self.sample_freqs_mhz))
+            ax.set_title(name)
+            ax.set_xlabel("Freq (MHz)")
+            ax.set_ylabel("Magnitude (dB)")
+            ax.set_ylim(-20, 100)
+            self.sample_lines[name] = line
+        fig.tight_layout()
+
+        self.sample_canvas = FigureCanvasTkAgg(fig, master=f)
+        self.sample_canvas.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+    def _on_sample_rate_change(self, _event=None):
+        try:
+            rate_hz = float(self.sample_rate_var.get())
+            if rate_hz <= 0:
+                raise ValueError
+        except ValueError:
+            self.sample_rate_var.set(f"{self.sample_rate_hz:.0f}")  # revert to last-good
+            return
+        self.sample_rate_hz = rate_hz
+        self.sample_freqs_mhz = np.fft.rfftfreq(DEFAULT_FFT_SIZE, d=1.0 / rate_hz) / 1e6
+        for line in self.sample_lines.values():
+            line.set_xdata(self.sample_freqs_mhz)
+        for ax in self.sample_axes.flat:
+            ax.set_xlim(self.sample_freqs_mhz[0], self.sample_freqs_mhz[-1])
+        self.sample_canvas.draw_idle()
+
+    def _toggle_sample_stream(self):
+        if self.sample_recv is None:
+            try:
+                self.sample_recv = SampleReceiver(fft_size=DEFAULT_FFT_SIZE)
+            except OSError as exc:
+                # Most likely cause: sample_stream_view.py (or another copy
+                # of this tab) already has SAMPLE_PORT bound -- only one
+                # listener can hold a given UDP port at a time.
+                self.sample_status_var.set(f"ERROR binding :{SAMPLE_PORT}: {exc}")
+                return
+            self.sample_recv.start()
+            self.sample_toggle_btn.config(text="Stop listening")
+            self._sample_update()
+        else:
+            self._stop_sample_stream()
+
+    def _stop_sample_stream(self):
+        if self.sample_after_id is not None:
+            self.root.after_cancel(self.sample_after_id)
+            self.sample_after_id = None
+        if self.sample_recv is not None:
+            self.sample_recv.stop()
+            self.sample_recv = None
+        self.sample_toggle_btn.config(text="Start listening")
+        self.sample_status_var.set("Not listening")
+
+    def _sample_update(self):
+        if self.sample_recv is None:
+            return
+        data = self.sample_recv.snapshot()
+        for name, line in self.sample_lines.items():
+            buf = data[name]
+            if len(buf) < DEFAULT_FFT_SIZE:
+                continue
+            spectrum = np.fft.rfft(buf[-DEFAULT_FFT_SIZE:] * self.sample_window)
+            line.set_ydata(20 * np.log10(np.abs(spectrum) + 1e-9))
+        self.sample_status_var.set(
+            f"Listening on :{SAMPLE_PORT} -- {self.sample_recv.packets_received} pkts, "
+            f"{self.sample_recv.bytes_received / 1024:.0f} KB, "
+            f"{self.sample_recv.packets_dropped} dropped"
+        )
+        self.sample_canvas.draw_idle()
+        self.sample_after_id = self.root.after(200, self._sample_update)
+
+    def _on_close(self):
+        self._stop_sample_stream()
+        self.root.destroy()
+
+    # ------------------------------------------------------------------
     def _on_bulk_read(self):
         dev = DEVICES["AXI (axi_registers)"]
         offsets = [offset for offset, _, _ in AXI_REGMAP_FIELDS]

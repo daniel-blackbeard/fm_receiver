@@ -232,6 +232,64 @@ void eth_tx_sg_commit(uint16_t hdr_len, uint32_t payload_addr, uint16_t payload_
     tx_next = (tx_next + 1u) % GEM_TX_FRAME_SLOTS;
 }
 
+/*
+ * GEM's TX DMA halts outright when it walks into a not-ready (USED=1)
+ * descriptor mid-frame, and does not resume on its own -- matches the
+ * reference XEmacPs driver's own comment on this condition ("it is
+ * expected that the user will reset the device in nearly all
+ * instances"). Recovery: stop TX, rewrite TXQBASE to firmware's current
+ * tx_next slot (resyncing GEM's hardware pointer to firmware's own
+ * bookkeeping), re-enable TX, pulse TSTART. Frames in flight between
+ * GEM's old position and tx_next are dropped -- same "drop rather than
+ * block" stance as the rest of this design.
+ *
+ * Only triggered on GEM_TXSR_HALT_MASK, not bare USEDREAD: USEDREAD
+ * alone is routine (GEM catching up to the ring's frontier, see its own
+ * comment in eth0.h) and every commit's TSTART pulse already handles it.
+ * Force-resyncing on every routine blip skips past whatever frame GEM
+ * was about to send next -- invisible for high-rate sample-stream
+ * traffic but drops rare, latency-sensitive replies before GEM reaches
+ * them.
+ *
+ * A second detector below (TXQBASE frozen with real work pending) covers
+ * a halt that leaves TXSR completely clean -- GEM can stop dead with
+ * zero error bits latched, invisible to the TXSR check alone.
+ */
+#define ETH_TX_STALL_CHECK_INTERVAL 65536u /* main-loop iterations between checks -- not hardware-timed, just infrequent enough to be nearly free */
+static uint32_t tx_stall_last_txqbase = 0xFFFFFFFFu; /* sentinel: first check only seeds this, never trips */
+static uint32_t tx_stall_counter = 0u;
+
+static void eth_tx_force_resync(void){
+    GEM_NWCTRL = GEM_NWCTRL & ~GEM_NWCTRL_TXEN;
+    GEM_TXQBASE = GEM_DESCRIPTOR_TX + tx_next * 2u * 8u;
+    __asm__ volatile ("dsb" ::: "memory"); /* TXQBASE must land before TXEN comes back */
+    GEM_NWCTRL = GEM_NWCTRL | GEM_NWCTRL_TXEN;
+    GEM_NWCTRL = GEM_NWCTRL | GEM_NWCTRL_TSTART;
+}
+
+void eth_tx_recover(void){
+    uint32_t status = GEM_TXSR;
+    uint8_t  stalled_silent = 0u;
+
+    if (status != 0u) {
+        GEM_TXSR = status; /* write-1-to-clear whatever's set -- harmless housekeeping either way */
+    }
+
+    tx_stall_counter++;
+    if ((tx_stall_counter & (ETH_TX_STALL_CHECK_INTERVAL - 1u)) == 0u) {
+        uint32_t cur_txqbase = GEM_TXQBASE;
+        uint8_t  work_pending = !(GEM_DESC_FLAGS(tx_next * 2u) & (1u << 31));
+        if (cur_txqbase == tx_stall_last_txqbase && work_pending) {
+            stalled_silent = 1u;
+        }
+        tx_stall_last_txqbase = cur_txqbase;
+    }
+
+    if ((status & GEM_TXSR_HALT_MASK) || stalled_silent) {
+        eth_tx_force_resync();
+    }
+}
+
 void eth_send_test_frame(void){
     eth_frame *frame = (eth_frame *) eth_tx_reserve();
     if (frame == NULL) {
@@ -315,13 +373,30 @@ static uint16_t ip_checksum(const uint8_t *hdr, uint32_t len)
 
 /* Byte offsets: 0-5 dest MAC, 6-11 src MAC, 12-13 EtherType, ARP payload
  * from 14 -- standard Ethernet+ARP wire layout. */
+/*
+ * Deferred retry state for eth_send_arp_reply(): eth_tx_reserve() can
+ * transiently fail under heavy sample-stream ring contention even though
+ * GEM itself is healthy. Unlike a dropped sample packet (an accepted
+ * tradeoff elsewhere in this design), losing the only attempt at an ARP
+ * reply breaks resolution outright -- nothing else prompts a retry from
+ * this side. Preserves just the fields eth_send_arp_reply() reads
+ * (requester's SHA at req[6:12], THA+SPA at req[22:32]) and retries once
+ * per main-loop pass via eth_arp_retry_poll() until it succeeds or a
+ * newer request supersedes it.
+ */
+static uint8_t arp_retry_pending = 0u;
+static uint8_t arp_retry_req[32];
+
 void eth_send_arp_reply(const uint8_t *req)
 {
     uint8_t *buf = (uint8_t *)eth_tx_reserve();
     uint32_t i;
     if (buf == NULL) {
+        for (i = 0u; i < 32u; i++) { arp_retry_req[i] = req[i]; }
+        arp_retry_pending = 1u;
         return;
     }
+    arp_retry_pending = 0u; /* this attempt succeeded -- drop any older pending retry */
 
     for (i = 0u; i < 6u; i++) { buf[i] = req[6u + i]; }         /* dest MAC = requester's src MAC */
     for (i = 0u; i < 6u; i++) { buf[6u + i] = g_board_mac[i]; } /* src MAC = board */
@@ -342,6 +417,21 @@ void eth_send_arp_reply(const uint8_t *req)
     for (i = 42u; i < ETH_MIN_FRAME_LEN; i++) { buf[i] = 0u; }
 
     eth_tx_commit(ETH_MIN_FRAME_LEN);
+}
+
+/*
+ * Retries a deferred ARP reply if one is pending -- call once per
+ * main-loop iteration, same cheap-when-idle idiom as
+ * eth_poll_sample_stream()/eth_tx_recover(). Re-enters
+ * eth_send_arp_reply(), which either succeeds (clearing the pending flag)
+ * or re-saves the identical bytes and stays pending for the next pass.
+ */
+void eth_arp_retry_poll(void)
+{
+    if (!arp_retry_pending) {
+        return;
+    }
+    eth_send_arp_reply(arp_retry_req);
 }
 
 /*
@@ -439,6 +529,50 @@ void eth_udp_reply_commit(uint16_t payload_len)
     }
 
     eth_tx_commit(total_frame_len);
+}
+
+/*
+ * Deferred retry state for the UDP command reply -- same ring-contention
+ * gap as eth_send_arp_reply() (see its comment), just on the command
+ * console's reply path instead. Preserves the header fields
+ * eth_udp_reply_reserve() reads (up through req[35], dest port) plus the
+ * already-computed reply payload, and retries once per main-loop pass via
+ * eth_udp_retry_poll() until it succeeds or a newer reply supersedes it.
+ */
+static uint8_t  udp_retry_pending = 0u;
+static uint8_t  udp_retry_req[38];
+static uint8_t  udp_retry_batch[ETH_UDP_MAX_REPLY_BYTES];
+static uint16_t udp_retry_bytes = 0u;
+
+void eth_udp_reply_send(const uint8_t *req, const uint8_t *batch, uint16_t bytes)
+{
+    uint8_t *out = (uint8_t *)eth_udp_reply_reserve(req);
+    uint16_t i;
+
+    if (out == NULL) {
+        for (i = 0u; i < 38u; i++) { udp_retry_req[i] = req[i]; }
+        for (i = 0u; i < bytes; i++) { udp_retry_batch[i] = batch[i]; }
+        udp_retry_bytes = bytes;
+        udp_retry_pending = 1u;
+        return;
+    }
+    udp_retry_pending = 0u; /* this attempt succeeded -- drop any older pending retry */
+
+    for (i = 0u; i < bytes; i++) { out[i] = batch[i]; }
+    eth_udp_reply_commit(bytes);
+}
+
+/*
+ * Retries a deferred UDP command reply if one is pending -- call once per
+ * main-loop iteration, same cheap-when-idle idiom as
+ * eth_arp_retry_poll()/eth_poll_sample_stream()/eth_tx_recover().
+ */
+void eth_udp_retry_poll(void)
+{
+    if (!udp_retry_pending) {
+        return;
+    }
+    eth_udp_reply_send(udp_retry_req, udp_retry_batch, udp_retry_bytes);
 }
 
 /*

@@ -28,9 +28,41 @@
 #define GEM_SPEC_ADDR1_BOT (*(volatile uint32_t *) (GEM_CORE_BASE + 0x088u))
 #define GEM_SPEC_ADDR1_TOP (*(volatile uint32_t *) (GEM_CORE_BASE + 0x08cu))
 
-#define GEM_NWCTRL_MDEN (1u << 4) /* management port enable -- must be set before any MDIO transaction */
-#define GEM_NWCTRL_RXEN (1u << 2)
-#define GEM_NWCTRL_TXEN (1u << 3)
+#define GEM_NWCTRL_MDEN   (1u << 4) /* management port enable -- must be set before any MDIO transaction */
+#define GEM_NWCTRL_RXEN   (1u << 2)
+#define GEM_NWCTRL_TXEN   (1u << 3)
+#define GEM_NWCTRL_TSTART (1u << 9) /* re-examine/resume the TX queue at its current pointer */
+
+/*
+ * GEM_TXSR (TX status) bits, values from Xilinx's XEmacPs driver
+ * (private/docs/.../xemacps_hw.h). GEM's TX DMA halts outright the
+ * instant it walks into a not-ready (USED=1) descriptor mid-frame, and
+ * does NOT resume on its own -- matches the reference driver's own
+ * comment ("it is expected that the user will reset the device in nearly
+ * all instances"). See eth_tx_recover() in eth0.c for the recovery.
+ */
+#define GEM_TXSR_HRESPNOK  (1u << 8) /* AHB bus error */
+#define GEM_TXSR_URUN      (1u << 6) /* TX underrun */
+#define GEM_TXSR_TXCOMPL   (1u << 5) /* a frame completed OK -- not an error, but sticky like the rest */
+#define GEM_TXSR_BUFEXH    (1u << 4) /* buffers exhausted mid-frame -- GEM already started a multi-descriptor frame and got stuck partway through it */
+#define GEM_TXSR_TXGO      (1u << 3) /* status of go flag -- not an error */
+#define GEM_TXSR_RETRY     (1u << 2) /* retry limit exceeded */
+#define GEM_TXSR_COLLISION (1u << 1) /* collision on TX frame */
+/*
+ * USEDREAD (bit0) alone -- GEM scanned for the next frame and found the
+ * ring's frontier not armed yet -- is the normal idle condition, not a
+ * halt: every eth_tx_commit()/eth_tx_sg_commit() already pulses TSTART
+ * unconditionally, which is all GEM needs to pick back up. Force-
+ * resyncing TXQBASE on every occurrence would skip whatever legitimate
+ * frame GEM was about to reach next -- harmless for sample-stream traffic
+ * (tx_next is always fresh) but drops sparser UDP command replies before
+ * GEM gets to them. GEM_TXSR_HALT_MASK deliberately excludes it -- only
+ * BUFEXH/HRESPNOK/URUN/RETRY/COLLISION, which mean GEM is genuinely stuck
+ * or hit a real error, trigger the aggressive resync.
+ */
+#define GEM_TXSR_USEDREAD  (1u << 0)
+#define GEM_TXSR_HALT_MASK (GEM_TXSR_HRESPNOK | GEM_TXSR_URUN | GEM_TXSR_BUFEXH | \
+                             GEM_TXSR_RETRY | GEM_TXSR_COLLISION)
 
 /* Valid DDR scratch range starts at 0x00200000 -- below that is either
  * this program's own load region or outside the PS7-declared usable
@@ -156,6 +188,14 @@ uint32_t phy_get_rtl_identifier(void);
 uint32_t phy_get_link_status(void);
 void *eth_tx_reserve(void);
 void eth_tx_commit(uint16_t len);
+
+/*
+ * Checks GEM_TXSR for a halted TX DMA (see GEM_TXSR_HALT_MASK above) and,
+ * if found, clears it and re-kicks the queue. Call once per main-loop
+ * iteration, same cadence as eth_service()/eth_poll_sample_stream() -- a
+ * single cheap register read when TX is healthy, which is nearly always.
+ */
+void eth_tx_recover(void);
 void eth_send_test_frame(void);
 
 /* Scatter-gather TX for zero-copy sample-stream sends -- shares the same
@@ -188,8 +228,16 @@ void *eth_rx_poll(uint16_t *len_out);
 void eth_rx_release(void);
 
 /* Minimal ARP responder: given a received frame already confirmed to be
- * an ARP request for this board's IP, builds and sends the reply. */
+ * an ARP request for this board's IP, builds and sends the reply. If the
+ * TX ring is momentarily full (real, confirmed on hardware under heavy
+ * sample-stream contention), the attempt is saved and retried
+ * automatically -- see eth_arp_retry_poll(). */
 void eth_send_arp_reply(const uint8_t *req_frame);
+
+/* Retries a deferred ARP reply if eth_send_arp_reply() couldn't get a TX
+ * slot on its first attempt. Call once per main-loop iteration, same
+ * cadence as eth_service()/eth_poll_sample_stream()/eth_tx_recover(). */
+void eth_arp_retry_poll(void);
 
 /* UDP reply builder, split reserve/commit like the TX ring, since the
  * final length fields and checksum can't be written until the caller
@@ -198,6 +246,19 @@ void eth_send_arp_reply(const uint8_t *req_frame);
  * ETH_UDP_MAX_REPLY_BYTES fits -- caller's responsibility. */
 void *eth_udp_reply_reserve(const uint8_t *req_frame);
 void eth_udp_reply_commit(uint16_t payload_len);
+
+/* Sends a UDP command reply (payload already computed into `batch`,
+ * `bytes` long), retrying automatically via eth_udp_retry_poll() if the
+ * TX ring is momentarily full (confirmed on real hardware under heavy
+ * sample-stream contention -- same class of gap eth_send_arp_reply() had,
+ * see its own comment in eth0.c). Preferred over calling
+ * eth_udp_reply_reserve()/eth_udp_reply_commit() directly. */
+void eth_udp_reply_send(const uint8_t *req_frame, const uint8_t *batch, uint16_t bytes);
+
+/* Retries a deferred UDP command reply if eth_udp_reply_send() couldn't
+ * get a TX slot on its first attempt. Call once per main-loop iteration,
+ * same cadence as the other eth_*_poll()/eth_tx_recover() calls. */
+void eth_udp_retry_poll(void);
 
 /* Test-only: synthesizes an ARP request for this board's IP directly into
  * the current RX slot, as if hardware had just received it. */

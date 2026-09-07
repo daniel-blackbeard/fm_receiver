@@ -44,7 +44,8 @@ module axi_dsp (
     output logic        dbg_pending,
     output logic        dbg_trigger,
     output logic        dbg_drain_bank,
-    output logic [19:0] dbg_wr_offset
+    output logic [19:0] dbg_wr_offset,
+    output logic        dbg_timeout // pulses once per watchdog recovery, see below
 );
 
     logic [63:0] buffer [0:31]; // 32 samples of 16 bits
@@ -122,6 +123,20 @@ module axi_dsp (
     logic  [2:0]  pl_addr_curr;
     logic  [9:0]  batch_addr;
 
+    // Watchdog: recovers from a hung S_AXI_HP0 response -- without it the
+    // FSM parks in BM_DATA forever with wvalid held and wready never
+    // returned. AXI3 forbids retracting AWVALID/WVALID mid-handshake in
+    // normal operation, but a genuinely hung slave leaves no other option
+    // than abandoning that one burst -- same "drop rather than block"
+    // stance as the rest of this design (sample_streaming_plan.md). 16
+    // bits gives ~655us margin at fclk0's 100MHz over any legitimate
+    // response delay. Counts only while waiting; reset on every real
+    // state entry/beat.
+    localparam logic [15:0] WATCHDOG_LIMIT = 16'hFFFF;
+    logic [15:0] wd_cnt;
+    logic        wd_timeout;
+    assign wd_timeout = (wd_cnt == WATCHDOG_LIMIT);
+
     always_ff @(posedge clk_fpga or negedge rstb_fpga) begin
         if (!rstb_fpga) begin
             state        <= BM_IDLE;
@@ -138,6 +153,8 @@ module axi_dsp (
             pl_addr_last <= '0;
             pl_addr_curr <= '0;
             batch_addr   <= '0;
+            wd_cnt       <= '0;
+            dbg_timeout  <= '0;
         end else begin
 
             if (trigger) pending <= 1'b1;
@@ -147,9 +164,12 @@ module axi_dsp (
             pl_update    <= {21'b0, batch_addr, 1'b1};
             pl_addr_curr <= wr_offset[9:7];
 
+            dbg_timeout <= 1'b0; // single-cycle pulse, see fm_receiver.sv's sticky mirror
+
             case (state)
 
                 BM_IDLE: begin
+                    wd_cnt <= '0;
                     if (pending) begin
                         pending  <= 1'b0;
                         awaddr   <= BANK_BASE + wr_offset;
@@ -176,11 +196,21 @@ module axi_dsp (
                         wstrb    <= 8'b11111111;
                         wvalid   <= 1'b1;
                         state    <= BM_DATA;
+                        wd_cnt   <= '0;
+                    end else if (wd_timeout) begin
+                        // AWREADY never came -- abandon this burst, go idle.
+                        awvalid     <= 1'b0;
+                        state       <= BM_IDLE;
+                        wd_cnt      <= '0;
+                        dbg_timeout <= 1'b1;
+                    end else begin
+                        wd_cnt <= wd_cnt + 16'd1;
                     end
                 end
 
                 BM_DATA: begin
                     if (wvalid && wready) begin
+                        wd_cnt <= '0;
                         if (beat_cnt == 1) begin
                             wvalid     <= 1'b0;
                             wlast      <= 1'b0;
@@ -192,6 +222,18 @@ module axi_dsp (
                             wdata    <= buffer[{drain_bank, rd_ptr + 4'd1}];
                             wlast    <= (beat_cnt == 2);
                         end
+                    end else if (wd_timeout) begin
+                        // WREADY never came -- abandon the rest of this
+                        // burst. Beats already landed stay in DDR as a
+                        // partial write; accepted.
+                        wvalid      <= 1'b0;
+                        wlast       <= 1'b0;
+                        drain_bank  <= ~drain_bank;
+                        state       <= BM_IDLE;
+                        wd_cnt      <= '0;
+                        dbg_timeout <= 1'b1;
+                    end else begin
+                        wd_cnt <= wd_cnt + 16'd1;
                     end
                 end
             endcase

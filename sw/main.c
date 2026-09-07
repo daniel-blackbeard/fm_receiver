@@ -170,6 +170,8 @@ static uint8_t uart1_getc(void)
 #define SYS_MODE_MISSION         0x02u
 #define SYS_MODE_ETH_TEST_FRAME  0x03u
 #define SYS_MODE_ETH_INJECT_ARP  0x04u
+#define SYS_MODE_TEST_PATTERN_PRBS  0x05u
+#define SYS_MODE_TEST_PATTERN_TONE  0x06u
 
 static void uart1_put32(uint32_t v)
 {
@@ -262,12 +264,21 @@ static uint8_t spi_transact(uint16_t ad9361_addr, uint8_t is_write, uint8_t wdat
 #define AD9361_TO_ALERT                    (1u << 0)
 
 /* REG_OBSERVE_CONFIG / REG_BIST_CONFIG: test-mode RX-side BIST/PRBS
- * pattern generator, per ad9361_registers.md / ADI's ad9361_bist_prbs(). */
+ * pattern generator, per ad9361_registers.md / ADI's ad9361_bist_prbs()
+ * and ad9361_bist_tone() (private/docs/.../ad9361.c). */
 #define AD9361_REG_OBSERVE_CONFIG 0x3F5u
 
 #define AD9361_REG_BIST_CONFIG 0x3F4u
 #define AD9361_BIST_ENABLE            (1u << 0)
+#define AD9361_TONE_PRBS              (1u << 1) /* 0 = PRBS, 1 = tone */
 #define AD9361_BIST_CTRL_POINT_RX(x)  (((x) & 0x3u) << 2)
+#define AD9361_TONE_LEVEL(x)          (((x) & 0x3u) << 4) /* 0 = full scale, steps of -6dB */
+#define AD9361_TONE_FREQ(x)           (((x) & 0x3u) << 6) /* code -> RX_SAMPL_CLK/32*(code+1) */
+
+/* REG_BIST_AND_DATA_PORT_TEST_CONFIG: per-I/Q-lane BIST mask (1 = exclude
+ * that lane from the tone). 0x00 = tone applied to all 4 lanes
+ * (ch0_i/q, ch1_i/q). Only meaningful in tone mode. */
+#define AD9361_REG_BIST_AND_DATA_PORT_TEST_CONFIG 0x3F6u
 
 /*
  * RX LO synthesizer (98MHz) + coarse RX_DATA_DELAY bring-up. Derived from
@@ -499,16 +510,25 @@ static void ad9361_common_init(void)
      * -- see bring_up_uart.txt. */
 }
 
+/* Set once test mode is actually active (and cleared on mission mode) --
+ * gates set_test_pattern_prbs()/set_test_pattern_tone() below, so a stray
+ * SYS_MODE_TEST_PATTERN_* command can't inject a synthetic BIST pattern
+ * over a real antenna signal while in mission mode. */
+static uint8_t g_test_mode_active = 0u;
+
 /*
  * Test mode: chip is already in real RX state (ad9361_common_init()
  * forces ALERT->RX at boot). Only remaining step: enable the RX-side
- * BIST pattern generator (BIST_CTRL_POINT=2=RX injection).
+ * BIST pattern generator (BIST_CTRL_POINT=2=RX injection), defaulting to
+ * PRBS -- see set_test_pattern_prbs()/set_test_pattern_tone() below to
+ * switch the pattern afterward.
  */
 static void enter_test_mode(void)
 {
     ad9361_spi_write(AD9361_REG_OBSERVE_CONFIG, 0u);
     ad9361_spi_write(AD9361_REG_BIST_CONFIG,
                       AD9361_BIST_CTRL_POINT_RX(2u) | AD9361_BIST_ENABLE);
+    g_test_mode_active = 1u;
 }
 
 /*
@@ -521,6 +541,31 @@ static void enter_test_mode(void)
 static void enter_mission_mode(void)
 {
     ad9361_spi_write(AD9361_REG_BIST_CONFIG, 0u);
+    g_test_mode_active = 0u;
+}
+
+/*
+ * Test-mode-only pattern select for the RX BIST generator, no-op outside
+ * test mode. prbs() restores the default pseudo-random sequence (see
+ * enter_test_mode()). tone() switches to a full-scale ~931kHz sine
+ * (RX_SAMPL_CLK/32, TONE_FREQ code 0) -- inside the sample-stream FFT's
+ * ~3.725MHz Nyquist edge, so it shows up as a clean known-frequency
+ * spike. Traced from ADI's ad9361_bist_tone() (private/docs/.../ad9361.c).
+ */
+static void set_test_pattern_prbs(void)
+{
+    if (!g_test_mode_active) { return; }
+    ad9361_spi_write(AD9361_REG_BIST_CONFIG,
+                      AD9361_BIST_CTRL_POINT_RX(2u) | AD9361_BIST_ENABLE);
+}
+
+static void set_test_pattern_tone(void)
+{
+    if (!g_test_mode_active) { return; }
+    ad9361_spi_write(AD9361_REG_BIST_AND_DATA_PORT_TEST_CONFIG, 0u);
+    ad9361_spi_write(AD9361_REG_BIST_CONFIG,
+                      AD9361_BIST_CTRL_POINT_RX(2u) | AD9361_BIST_ENABLE |
+                      AD9361_TONE_PRBS | AD9361_TONE_LEVEL(0u) | AD9361_TONE_FREQ(0u));
 }
 
 /*
@@ -638,6 +683,10 @@ static uint8_t dispatch_command(const uint8_t *req, uint32_t *reply)
                 eth_send_test_frame();
             } else if (mode == SYS_MODE_ETH_INJECT_ARP) {
                 eth_test_inject_arp_request();
+            } else if (mode == SYS_MODE_TEST_PATTERN_PRBS) {
+                set_test_pattern_prbs();
+            } else if (mode == SYS_MODE_TEST_PATTERN_TONE) {
+                set_test_pattern_tone();
             }
         }
     }
@@ -719,13 +768,7 @@ static void eth_process_udp_command_frame(const uint8_t *req_frame, const uint8_
     }
 
     if (reply_bytes > 0u) {
-        uint8_t *out = (uint8_t *)eth_udp_reply_reserve(req_frame);
-        if (out != NULL) {
-            for (uint16_t i = 0; i < reply_bytes; i++) {
-                out[i] = reply_batch[i];
-            }
-            eth_udp_reply_commit(reply_bytes);
-        }
+        eth_udp_reply_send(req_frame, reply_batch, reply_bytes);
     }
 }
 
@@ -808,12 +851,18 @@ void main(void)
      * uart1_available() is non-blocking so a missing UART byte can't
      * starve eth_service(). eth_poll_sample_stream() is a cheap register
      * check when axi_dsp has nothing new, so it costs nothing to poll
-     * every iteration alongside the others. */
+     * every iteration alongside the others. eth_tx_recover() is the same
+     * kind of cheap check -- detects and clears a halted GEM TX DMA (see
+     * its own header comment in eth0.h) before it can silently kill both
+     * UDP command replies and sample-stream packets for good. */
     for (;;) {
         if (uart1_available()) {
             process_uart_command();
         }
         eth_service();
         eth_poll_sample_stream();
+        eth_tx_recover();
+        eth_arp_retry_poll();
+        eth_udp_retry_poll();
     }
 }

@@ -379,6 +379,7 @@ wire        axi_dsp_dbg_pending;
 wire        axi_dsp_dbg_trigger;
 wire        axi_dsp_dbg_drain_bank;
 wire [19:0] axi_dsp_dbg_wr_offset;
+wire        axi_dsp_dbg_timeout;
 
 // dsp_clk-domain reset synchronizer for axi_dsp's rstb_dsp: fclk0_rstn
 // crossed into dsp_clk via async-assert/sync-release (asserts immediately,
@@ -439,7 +440,8 @@ axi_dsp u_axi_dsp (
     .dbg_pending    (axi_dsp_dbg_pending),
     .dbg_trigger    (axi_dsp_dbg_trigger),
     .dbg_drain_bank (axi_dsp_dbg_drain_bank),
-    .dbg_wr_offset  (axi_dsp_dbg_wr_offset)
+    .dbg_wr_offset  (axi_dsp_dbg_wr_offset),
+    .dbg_timeout    (axi_dsp_dbg_timeout)
 );
 
 axi_if u_axi_if (
@@ -629,7 +631,16 @@ always_ff @(posedge fclk0 or negedge fclk0_rstn) begin
     else if (axi_dsp_dbg_trigger) seen_trigger <= 1'b1;
 end
 
-wire [31:0] dbg_axi_dsp_status = {7'b0, axi_dsp_dbg_wr_offset, axi_dsp_dbg_drain_bank,
+// Saturating count of axi_dsp's own watchdog recoveries (see axi_dsp.sv).
+// A count rather than a single sticky bit so repeated occurrences are
+// distinguishable from one.
+logic [6:0] dsp_timeout_count;
+always_ff @(posedge fclk0 or negedge fclk0_rstn) begin
+    if (!fclk0_rstn) dsp_timeout_count <= 7'b0;
+    else if (axi_dsp_dbg_timeout && dsp_timeout_count != 7'h7F) dsp_timeout_count <= dsp_timeout_count + 7'd1;
+end
+
+wire [31:0] dbg_axi_dsp_status = {dsp_timeout_count, axi_dsp_dbg_wr_offset, axi_dsp_dbg_drain_bank,
                                    seen_trigger, axi_dsp_dbg_pending, axi_dsp_dbg_state};
 
 // Debug taps share axi_notifications' single PL write port with axi_dsp's
