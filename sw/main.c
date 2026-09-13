@@ -158,6 +158,8 @@ static uint8_t uart1_getc(void)
 #define CMD_DEV_DESC_RX 0x1Cu
 #define CMD_DEV_RXBUF   0x20u
 #define CMD_DEV_NOTIF   0x24u
+#define CMD_DEV_RXLO    0x28u /* write-only: data = target RX LO freq in Hz, see ad9361_rx_lo_synth_set() */
+#define CMD_DEV_GAIN    0x2Cu /* write-only: addr 0x00 = gain mode select (data = mode, see ad9361_set_rx_gain_mode()), addr 0x04 = manual gain table index (data = 0-76, see ad9361_set_rx_manual_gain()) */
 #define CMD_RW_WRITE (1u << 0)
 
 /*
@@ -247,8 +249,39 @@ static uint8_t spi_transact(uint16_t ad9361_addr, uint8_t is_write, uint8_t wdat
 #define AD9361_REG_FRACT_BB_FREQ_WORD_2  0x042u
 #define AD9361_REG_FRACT_BB_FREQ_WORD_3  0x043u
 
+/* RX sample-rate chain (REG_BBPLL's ADC divider + REG_RX_ENABLE_FILTER_CTRL's
+ * three half-band/FIR decimation stages) -- distinct from the BBPLL
+ * programming registers above, which only lock the 960MHz BBPLL itself.
+ * Derived register-by-register from ADI's ad9361_get_clk_scaler()/
+ * ad9361_set_clk_scaler() (private/docs/.../ad9361.c), same rigor as the
+ * RX LO synth below. See README.md's "AD9361 RX digital bring-up" section
+ * for the full chain (BBPLL -> ADC_CLK -> R2_CLK -> R1_CLK -> CLKRF_CLK ->
+ * RX_SAMPL_CLK) and how this specific configuration was derived from a
+ * live REG_RX_ENABLE_FILTER_CTRL readback (0x5F) that decoded to a
+ * completely unconfigured, un-bypassed decimation chain landing at
+ * ~7.5MHz -- confirmed two independent ways (CIC-decimated sample-stream
+ * rate, and a dsp_clk-domain LED counter) before this fix was written.
+ */
+#define AD9361_REG_BBPLL                 0x00Au /* BBPLL_DIVIDER<2:0> = bits[2:0]; ADC_CLK = BBPLL_FREQ >> BBPLL_DIVIDER */
+#define AD9361_REG_RX_ENABLE_FILTER_CTRL 0x003u
+
 #define AD9361_REG_CH_1_OVERFLOW 0x05Eu
 #define AD9361_BBPLL_LOCK        (1u << 7)
+
+/* RX physical port select -- which RX1/RX2 pins (A/B/C, balanced/
+ * unbalanced) are actually active on the analog front end. Never written
+ * anywhere before 2026-09-13 (this firmware only ever configured the
+ * digital/clock side), so the chip ran on its POR default -- harmless to
+ * the BIST tone (injected digitally, after this stage entirely) but left
+ * real antenna signal badly attenuated/mismatched. 0x03 = RX1A+RX2A
+ * balanced (both _N and _P), the standard default on essentially every
+ * ADI AD9361 reference board -- confirmed live via SPI poke to fix real-
+ * signal reception on this board's RX1 SMA. See ad9361_rf_port_setup()
+ * in private/docs/.../ad9361.c for the full encoding if this board turns
+ * out to use a different port/pin.
+ */
+#define AD9361_REG_INPUT_SELECT      0x004u
+#define AD9361_INPUT_SELECT_RX1A_RX2A_BALANCED 0x03u
 
 #define AD9361_REG_PARALLEL_PORT_CONF_1 0x010u
 #define AD9361_REG_PARALLEL_PORT_CONF_2 0x011u
@@ -335,6 +368,85 @@ static uint8_t spi_transact(uint16_t ad9361_addr, uint8_t is_write, uint8_t wdat
 
 #define AD9361_REG_RX_CLOCK_DATA_DELAY 0x006u
 #define AD9361_RX_DATA_DELAY_DEFAULT   0x0Bu /* RX_DATA_DELAY<3:0>, DATA_CLK_DELAY<7:4>=0 -- hand-verified via scripts/_clkdata_delay_sweep_live.tcl */
+
+/*
+ * RX gain control (AGC/MGC) -- distinct from the RX LO synth and sample-
+ * rate chain above. The AD9361 has no default/built-in RX gain table: it
+ * ships out of reset with the internal 77-entry table (REG_GAIN_TABLE_*
+ * below) unpopulated, so selecting a gain index -- whether the AGC engine
+ * picks it automatically or it's written manually -- looks up meaningless
+ * content until the table is host-loaded once. Register set, table
+ * content, and load sequence all traced from ADI's ad9361_load_gt() /
+ * ad9361_gc_setup() (private/docs/.../ad9361.c) for the 0-1.3GHz band
+ * (98MHz falls in it), full-table (not split-table) format, 77 entries --
+ * this project's HAVE_SPLIT_GAIN_TABLE equivalent is effectively off, so
+ * full-table is the only format that matters here.
+ */
+#define AD9361_REG_AGC_CONFIG_1             0x0FAu /* RX1 mode = bits[1:0], RX2 mode = bits[3:2]: 0=MGC (manual), 1=fast-attack AGC, 2=slow-attack AGC, 3=hybrid AGC */
+#define AD9361_REG_AGC_CONFIG_2             0x0FBu
+#define AD9361_AGC_CONFIG_2_VAL             0x08u /* bit0/1 MAN_GAIN_CTRL_RX1/RX2=0 (gain set via SPI register, not external ctrl pins); bit2 DIG_GAIN_EN=0 (digital gain unused); bit3 AGC_USE_FULL_GAIN_TABLE=1 */
+#define AD9361_REG_MAX_LMT_FULL_GAIN        0x0FDu
+
+#define AD9361_REG_RX1_MANUAL_LMT_FULL_GAIN      0x109u /* bits[6:0] = gain table index, 0-76 (~ -1dB..73dB for this band, see ADI's abs_gain_tbl) */
+#define AD9361_REG_RX1_MANUAL_DIGITALFORCED_GAIN 0x10Bu
+
+#define AD9361_REG_GAIN_TABLE_ADDRESS     0x130u
+#define AD9361_REG_GAIN_TABLE_WRITE_DATA1 0x131u
+#define AD9361_REG_GAIN_TABLE_WRITE_DATA2 0x132u
+#define AD9361_REG_GAIN_TABLE_WRITE_DATA3 0x133u
+#define AD9361_REG_GAIN_TABLE_READ_DATA1  0x134u
+#define AD9361_REG_GAIN_TABLE_CONFIG      0x137u
+#define AD9361_START_GAIN_TABLE_CLOCK     (1u << 1)
+#define AD9361_WRITE_GAIN_TABLE           (1u << 2)
+#define AD9361_RECEIVER_SELECT_RX1        (1u << 3) /* RECEIVER_SELECT(1) -- RX2 is never loaded, RX2 unused in this design */
+
+/* Pulsed once, right after forcing ENSM into RX while in MGC mode -- ADI's
+ * ad9361_ensm_set_state() does this immediately after its own
+ * REG_ENSM_CONFIG_1 write, whenever agc_mode==RF_GAIN_MGC. Without it,
+ * RX1's analog gain-control block may never actually settle into the
+ * loaded table/mode even though the config registers themselves read back
+ * correctly -- suspected cause of a real, reproducible sample-rate
+ * collapse (dsp_clk-derived CIC decimation strobe dropped from
+ * ~8823pkts/s to ~191pkts/s after adding gain control without this pulse,
+ * 2026-09-13, see project memory). */
+#define AD9361_REG_SMALL_LMT_OVERLOAD_THRESH  0x107u
+#define AD9361_SMALL_LMT_OVERLOAD_THRESH_MASK 0x3Fu
+#define AD9361_FORCE_PD_RESET_RX1             (1u << 6)
+
+#define AD9361_GAIN_TABLE_SIZE 77u
+
+/* Verbatim from ADI's full_gain_table[TBL_200_1300_MHZ] (ad9361.c) -- per-
+ * index {ext/int LNA & mixer gain word, TIA & LPF word, DC-cal bit & digital
+ * gain word}. Index i's absolute gain is roughly (i-3)dB for i>=3 (0dB at
+ * i=3, ~73dB at i=76), per ADI's full_gain_table_abs_gain for this band. */
+static const uint8_t ad9361_gain_table_200_1300mhz[AD9361_GAIN_TABLE_SIZE][3] = {
+    {0x00, 0x00, 0x20}, {0x00, 0x00, 0x00}, {0x00, 0x00, 0x00},
+    {0x00, 0x01, 0x00}, {0x00, 0x02, 0x00}, {0x00, 0x03, 0x00},
+    {0x00, 0x04, 0x00}, {0x00, 0x05, 0x00}, {0x01, 0x03, 0x20},
+    {0x01, 0x04, 0x00}, {0x01, 0x05, 0x00}, {0x01, 0x06, 0x00},
+    {0x01, 0x07, 0x00}, {0x01, 0x08, 0x00}, {0x01, 0x09, 0x00},
+    {0x01, 0x0A, 0x00}, {0x01, 0x0B, 0x00}, {0x01, 0x0C, 0x00},
+    {0x01, 0x0D, 0x00}, {0x01, 0x0E, 0x00}, {0x02, 0x09, 0x20},
+    {0x02, 0x0A, 0x00}, {0x02, 0x0B, 0x00}, {0x02, 0x0C, 0x00},
+    {0x02, 0x0D, 0x00}, {0x02, 0x0E, 0x00}, {0x02, 0x0F, 0x00},
+    {0x02, 0x10, 0x00}, {0x02, 0x2B, 0x20}, {0x02, 0x2C, 0x00},
+    {0x04, 0x28, 0x20}, {0x04, 0x29, 0x00}, {0x04, 0x2A, 0x00},
+    {0x04, 0x2B, 0x00}, {0x24, 0x20, 0x20}, {0x24, 0x21, 0x00},
+    {0x44, 0x20, 0x20}, {0x44, 0x21, 0x00}, {0x44, 0x22, 0x00},
+    {0x44, 0x23, 0x00}, {0x44, 0x24, 0x00}, {0x44, 0x25, 0x00},
+    {0x44, 0x26, 0x00}, {0x44, 0x27, 0x00}, {0x44, 0x28, 0x00},
+    {0x44, 0x29, 0x00}, {0x44, 0x2A, 0x00}, {0x44, 0x2B, 0x00},
+    {0x44, 0x2C, 0x00}, {0x44, 0x2D, 0x00}, {0x44, 0x2E, 0x00},
+    {0x44, 0x2F, 0x00}, {0x44, 0x30, 0x00}, {0x44, 0x31, 0x00},
+    {0x44, 0x32, 0x00}, {0x64, 0x2E, 0x20}, {0x64, 0x2F, 0x00},
+    {0x64, 0x30, 0x00}, {0x64, 0x31, 0x00}, {0x64, 0x32, 0x00},
+    {0x64, 0x33, 0x00}, {0x64, 0x34, 0x00}, {0x64, 0x35, 0x00},
+    {0x64, 0x36, 0x00}, {0x64, 0x37, 0x00}, {0x64, 0x38, 0x00},
+    {0x65, 0x38, 0x20}, {0x66, 0x38, 0x20}, {0x67, 0x38, 0x20},
+    {0x68, 0x38, 0x20}, {0x69, 0x38, 0x20}, {0x6A, 0x38, 0x20},
+    {0x6B, 0x38, 0x20}, {0x6C, 0x38, 0x20}, {0x6D, 0x38, 0x20},
+    {0x6E, 0x38, 0x20}, {0x6F, 0x38, 0x20}
+};
 
 static void ad9361_spi_write(uint16_t ad9361_addr, uint8_t val)
 {
@@ -456,11 +568,275 @@ static void ad9361_rx_lo_synth_98mhz(void)
 }
 
 /*
+ * Generalized RX LO retune, for FM broadcast tuning (78-108MHz-ish) on
+ * top of the 98MHz bring-up above. NOT YET hardware-verified -- 98MHz is
+ * the only frequency confirmed on real hw so far; this needs a bring-up
+ * pass next session (sweep the band edges + a few points in between,
+ * check VCO_LOCK and confirm against a known station) before it's
+ * trusted the way ad9361_rx_lo_synth_98mhz() is.
+ *
+ * Derived from ADI's ad9361_calc_rfpll_int_divder() / ad9361_rfpll_vco_init()
+ * / ad9361_rfpll_int_set_rate() (private/docs/.../ad9361.c), but unlike
+ * the 98MHz bring-up sequence above, this does NOT redo charge-pump
+ * calibration (ad9361_txrx_synth_cp_calib()) or touch ENSM state.
+ * ad9361_rfpll_int_set_rate() -- ADI's real per-frequency retune path --
+ * only rewrites the VCO-band LUT registers and the N-divider, then waits
+ * for VCO_LOCK; CP cal is a one-time init step (already done once in
+ * ad9361_common_init() via ad9361_rx_lo_synth_98mhz()). So this should be
+ * callable at any time after boot, including while already in real RX
+ * state -- no ALERT/FDD bounce needed, RX should just glitch briefly
+ * while the PLL relocks.
+ *
+ * The VCO LUT rows below are ADI's SynthLUT_TDD[LUT_FTDD_40] table
+ * verbatim (ad9361.c:232) -- the same table the 98MHz sequence pulled
+ * its one row from (confirmed TDD not FDD: that row's loop-filter fields
+ * only match the TDD table, not the FDD one, at the same VCO_MHz entry).
+ * All 53 rows are kept rather than just an FM-band subset -- it's cheap,
+ * and avoids having to reason precisely about which rows the divider
+ * crossover near ~93.75MHz (where vco_div flips 6->5 inside the FM band)
+ * actually touches.
+ */
+#define AD9361_REFCLK_HZ       40000000UL /* confirmed un-doubled -- see 98MHz comment above */
+#define AD9361_RFPLL_MODULUS   8388593UL
+#define AD9361_MIN_VCO_FREQ_HZ 6000000000ULL
+#define AD9361_RX_LO_MIN_HZ    60000000UL  /* headroom below the 78MHz FM edge */
+#define AD9361_RX_LO_MAX_HZ    130000000UL /* headroom above the 108MHz FM edge; also keeps
+                                             * the vco_div search below from ever looping on
+                                             * a 0 or out-of-range input (external command data) */
+
+struct ad9361_vco_lut_row {
+    uint16_t vco_mhz;
+    uint8_t  output_level;
+    uint8_t  varactor;
+    uint8_t  bias_ref;
+    uint8_t  bias_tcf;
+    uint8_t  cal_offset;
+    uint8_t  varactor_ref;
+    uint8_t  cp_current;
+    uint8_t  lf_c2;
+    uint8_t  lf_c1;
+    uint8_t  lf_r1;
+    uint8_t  lf_c3;
+    uint8_t  lf_r3;
+};
+
+/* ADI SynthLUT_TDD[LUT_FTDD_40] verbatim, ref clk <=40MHz row (ad9361.c:234-286) */
+static const struct ad9361_vco_lut_row ad9361_vco_lut_40mhz[53] = {
+    {12605, 13, 1, 4, 2, 15, 12, 27, 12, 15, 12, 4, 13},
+    {12245, 13, 1, 4, 2, 15, 12, 27, 12, 15, 12, 4, 13},
+    {11906, 13, 1, 4, 2, 15, 12, 26, 11, 15, 12, 4, 13},
+    {11588, 13, 1, 4, 2, 15, 12, 28, 12, 15, 12, 4, 13},
+    {11288, 13, 1, 4, 2, 15, 12, 30, 12, 15, 12, 4, 13},
+    {11007, 13, 1, 4, 2, 15, 12, 32, 12, 15, 12, 4, 13},
+    {10742, 13, 1, 4, 2, 15, 12, 33, 12, 15, 12, 4, 13},
+    {10492, 13, 1, 6, 2, 15, 12, 35, 12, 15, 12, 4, 13},
+    {10258, 13, 1, 6, 2, 15, 12, 37, 12, 15, 12, 4, 13},
+    {10036, 13, 1, 6, 2, 15, 12, 38, 12, 15, 12, 4, 13},
+    {9827,  13, 1, 6, 2, 14, 12, 40, 12, 15, 12, 4, 13},
+    {9631,  13, 1, 6, 2, 13, 12, 42, 12, 15, 12, 4, 13},
+    {9445,  13, 1, 6, 2, 12, 12, 44, 12, 15, 12, 4, 13},
+    {9269,  13, 1, 6, 2, 12, 12, 45, 12, 15, 12, 4, 13},
+    {9103,  13, 1, 6, 2, 12, 12, 47, 12, 15, 12, 4, 13},
+    {8946,  13, 1, 6, 2, 12, 12, 49, 12, 15, 12, 4, 13},
+    {8797,  12, 1, 7, 2, 12, 12, 48, 12, 15, 12, 4, 13},
+    {8655,  12, 1, 7, 2, 12, 12, 50, 12, 15, 12, 4, 13},
+    {8520,  12, 1, 7, 2, 12, 12, 51, 12, 15, 12, 4, 13},
+    {8392,  12, 1, 7, 2, 12, 12, 53, 12, 15, 12, 4, 13},
+    {8269,  12, 1, 7, 2, 12, 12, 55, 12, 15, 12, 4, 13},
+    {8153,  12, 1, 7, 2, 12, 12, 56, 12, 15, 12, 4, 13},
+    {8041,  12, 1, 7, 2, 13, 12, 58, 12, 15, 12, 4, 13},
+    {7934,  11, 1, 7, 2, 12, 12, 57, 12, 15, 12, 4, 13},
+    {7831,  11, 1, 7, 2, 12, 12, 58, 12, 15, 12, 4, 13},
+    {7733,  10, 1, 7, 3, 13, 12, 56, 12, 15, 12, 4, 13},
+    {7638,  10, 1, 7, 2, 12, 12, 58, 12, 15, 12, 4, 13},
+    {7547,  10, 1, 7, 2, 12, 12, 59, 12, 15, 12, 4, 13},
+    {7459,  10, 1, 7, 2, 12, 12, 61, 12, 15, 12, 4, 13},
+    {7374,  10, 2, 7, 3, 14, 13, 49, 12, 15, 12, 4, 13},
+    {7291,  10, 2, 7, 3, 14, 13, 50, 12, 15, 12, 4, 13},
+    {7212,  10, 2, 7, 3, 14, 13, 51, 12, 15, 12, 4, 13},
+    {7135,  10, 2, 7, 3, 14, 13, 52, 12, 15, 12, 4, 13},
+    {7061,  10, 2, 7, 3, 14, 13, 53, 12, 15, 12, 4, 13},
+    {6988,  10, 1, 7, 3, 12, 14, 63, 11, 14, 12, 3, 13},
+    {6918,  9,  2, 7, 3, 14, 13, 52, 12, 15, 12, 4, 13},
+    {6850,  9,  2, 7, 3, 14, 13, 53, 12, 15, 12, 4, 13},
+    {6784,  9,  2, 7, 2, 13, 13, 54, 12, 15, 12, 4, 13},
+    {6720,  9,  2, 7, 2, 13, 13, 56, 12, 15, 12, 4, 13},
+    {6658,  8,  2, 7, 3, 14, 13, 53, 12, 15, 12, 4, 13},
+    {6597,  8,  2, 7, 2, 13, 13, 54, 12, 15, 12, 4, 13},
+    {6539,  8,  2, 7, 2, 13, 13, 55, 12, 15, 12, 4, 13},
+    {6482,  8,  2, 7, 2, 13, 13, 56, 12, 15, 12, 4, 13},
+    {6427,  7,  2, 7, 3, 14, 13, 54, 12, 15, 12, 4, 13},
+    {6373,  7,  2, 7, 3, 15, 13, 54, 12, 15, 12, 4, 13},
+    {6321,  7,  2, 7, 3, 15, 13, 55, 12, 15, 12, 4, 13},
+    {6270,  7,  2, 7, 3, 15, 13, 56, 12, 15, 12, 4, 13},
+    {6222,  7,  2, 7, 3, 15, 13, 57, 12, 15, 12, 4, 13},
+    {6174,  6,  2, 7, 3, 15, 13, 54, 12, 15, 12, 4, 13},
+    {6128,  6,  2, 7, 3, 15, 13, 55, 12, 15, 12, 4, 13},
+    {6083,  6,  2, 7, 3, 15, 13, 56, 12, 15, 12, 4, 13},
+    {6040,  6,  2, 7, 3, 15, 13, 57, 12, 15, 12, 4, 13},
+    {5997,  6,  2, 7, 3, 15, 13, 58, 12, 15, 12, 4, 13},
+};
+
+/*
+ * Self-contained unsigned 64-by-32 division via restoring binary long
+ * division (64 fixed shift/compare/subtract iterations -- negligible
+ * cost, this only runs a couple of times per retune). Needed because
+ * sw/build.bat links with `arm-none-eabi-ld` directly, not through gcc,
+ * so libgcc's __aeabi_uidiv/__aeabi_uldivmod are NOT linked in -- a
+ * plain `/` or `%` anywhere in this file (even 32-bit, even at compile-
+ * time-constant divisors, since -O0 skips the strength-reduction that
+ * would otherwise avoid the library call) would fail to link. This
+ * routine uses only shifts/compares/subtracts, which the compiler
+ * always emits as native instruction sequences, never a library call.
+ */
+static uint32_t ad9361_udiv64_32(uint64_t num, uint32_t den, uint32_t *rem_out)
+{
+    uint64_t remainder = 0;
+    uint64_t quotient = 0;
+    for (int32_t i = 63; i >= 0; i--) {
+        remainder = (remainder << 1) | ((num >> i) & 1u);
+        quotient <<= 1;
+        if (remainder >= den) {
+            remainder -= den;
+            quotient |= 1u;
+        }
+    }
+    if (rem_out) { *rem_out = (uint32_t)remainder; }
+    return (uint32_t)quotient;
+}
+
+static void ad9361_rx_lo_synth_set(uint32_t freq_hz)
+{
+    if (freq_hz < AD9361_RX_LO_MIN_HZ || freq_hz > AD9361_RX_LO_MAX_HZ) {
+        return;
+    }
+
+    /* ad9361_calc_rfpll_int_divder(): double the target until it clears
+     * the 6GHz VCO floor, tracking the divider count. */
+    uint64_t vco_hz = (uint64_t)freq_hz;
+    int32_t vco_div = -1;
+    while (vco_hz <= AD9361_MIN_VCO_FREQ_HZ) {
+        vco_hz <<= 1;
+        vco_div++;
+    }
+
+    uint32_t rem;
+    uint32_t integer = ad9361_udiv64_32(vco_hz, AD9361_REFCLK_HZ, &rem);
+    uint64_t fract_num = (uint64_t)rem * (uint64_t)AD9361_RFPLL_MODULUS
+                          + (uint64_t)(AD9361_REFCLK_HZ >> 1); /* round to nearest */
+    uint32_t fract = ad9361_udiv64_32(fract_num, AD9361_REFCLK_HZ, NULL);
+
+    /* ad9361_rfpll_vco_init(): vco_freq in MHz (truncating, matching the
+     * reference driver) picks the LUT row. */
+    uint32_t vco_mhz = ad9361_udiv64_32(vco_hz, 1000000UL, NULL);
+    uint32_t idx = 0;
+    while (idx < 52u && (uint32_t)ad9361_vco_lut_40mhz[idx].vco_mhz > vco_mhz) {
+        idx++;
+    }
+    const struct ad9361_vco_lut_row *row = &ad9361_vco_lut_40mhz[idx];
+
+    ad9361_spi_write(AD9361_REG_RX_VCO_OUTPUT,
+                      (uint8_t)((row->output_level & 0xFu) | 0x40u)); /* PORB_VCO_LOGIC */
+    ad9361_spi_rmw(AD9361_REG_RX_ALC_VARACTOR, 0xFu, 0u, row->varactor);
+    ad9361_spi_write(AD9361_REG_RX_VCO_BIAS_1,
+                      (uint8_t)(((row->bias_tcf & 0x3u) << 3) | (row->bias_ref & 0x7u)));
+    ad9361_spi_write(AD9361_REG_RX_FORCE_VCO_TUNE_1,
+                      (uint8_t)((row->cal_offset & 0xFu) << 3));
+    ad9361_spi_write(AD9361_REG_RX_VCO_VARACTOR_CTRL_1, (uint8_t)(row->varactor_ref & 0xFu));
+    ad9361_spi_write(AD9361_REG_RX_VCO_CAL_REF, 0x00u);
+    ad9361_spi_write(AD9361_REG_RX_VCO_VARACTOR_CTRL_0, 0x70u);
+    ad9361_spi_rmw(AD9361_REG_RX_CP_CURRENT, 0x3Fu, 0u, row->cp_current);
+    ad9361_spi_write(AD9361_REG_RX_LOOP_FILTER_1,
+                      (uint8_t)(((row->lf_c2 & 0xFu) << 4) | (row->lf_c1 & 0xFu)));
+    ad9361_spi_write(AD9361_REG_RX_LOOP_FILTER_2,
+                      (uint8_t)(((row->lf_r1 & 0xFu) << 4) | (row->lf_c3 & 0xFu)));
+    ad9361_spi_write(AD9361_REG_RX_LOOP_FILTER_3, (uint8_t)(row->lf_r3 & 0xFu));
+
+    ad9361_spi_write(AD9361_REG_RX_FRACT_BYTE_2, (uint8_t)((fract >> 16) & 0x7Fu));
+    ad9361_spi_write(AD9361_REG_RX_FRACT_BYTE_1, (uint8_t)((fract >> 8) & 0xFFu));
+    ad9361_spi_write(AD9361_REG_RX_FRACT_BYTE_0, (uint8_t)(fract & 0xFFu));
+    ad9361_spi_rmw(AD9361_REG_RX_INTEGER_BYTE_1, 0x7u, 0u, (uint8_t)((integer >> 8) & 0x7u));
+    ad9361_spi_write(AD9361_REG_RX_INTEGER_BYTE_0, (uint8_t)(integer & 0xFFu));
+    ad9361_spi_rmw(AD9361_REG_RFPLL_DIVIDERS, 0xFu, 0u, (uint8_t)vco_div);
+
+    for (uint32_t tries = 0; tries < 100u; tries++) {
+        if (ad9361_spi_read(AD9361_REG_RX_CP_OVERRANGE_VCO_LOCK) & AD9361_VCO_LOCK) {
+            break;
+        }
+        delay(1000u);
+    }
+}
+
+/*
+ * One-time load of the internal RX gain table (RX1 only -- RX2 is never
+ * connected/used in this design). Common to both AGC and MGC, since both
+ * just index into this same table -- doesn't need re-running when the gain
+ * mode is switched, only if the RX LO ever moved to a different ADI gain-
+ * table band (never happens here, fixed at 98MHz). See the register block
+ * above for the full derivation.
+ */
+static void ad9361_rx_gain_table_load(void)
+{
+    ad9361_spi_write(AD9361_REG_AGC_CONFIG_2, AD9361_AGC_CONFIG_2_VAL);
+    ad9361_spi_write(AD9361_REG_MAX_LMT_FULL_GAIN, (uint8_t)(AD9361_GAIN_TABLE_SIZE - 1u));
+
+    ad9361_spi_write(AD9361_REG_GAIN_TABLE_CONFIG,
+                      AD9361_START_GAIN_TABLE_CLOCK | AD9361_RECEIVER_SELECT_RX1);
+    for (uint32_t i = 0; i < AD9361_GAIN_TABLE_SIZE; i++) {
+        ad9361_spi_write(AD9361_REG_GAIN_TABLE_ADDRESS, (uint8_t)i);
+        ad9361_spi_write(AD9361_REG_GAIN_TABLE_WRITE_DATA1, ad9361_gain_table_200_1300mhz[i][0]);
+        ad9361_spi_write(AD9361_REG_GAIN_TABLE_WRITE_DATA2, ad9361_gain_table_200_1300mhz[i][1]);
+        ad9361_spi_write(AD9361_REG_GAIN_TABLE_WRITE_DATA3, ad9361_gain_table_200_1300mhz[i][2]);
+        ad9361_spi_write(AD9361_REG_GAIN_TABLE_CONFIG,
+                          AD9361_START_GAIN_TABLE_CLOCK | AD9361_WRITE_GAIN_TABLE |
+                          AD9361_RECEIVER_SELECT_RX1);
+        ad9361_spi_write(AD9361_REG_GAIN_TABLE_READ_DATA1, 0u); /* dummy write, delay */
+        ad9361_spi_write(AD9361_REG_GAIN_TABLE_READ_DATA1, 0u); /* dummy write, delay */
+    }
+    ad9361_spi_write(AD9361_REG_GAIN_TABLE_CONFIG,
+                      AD9361_START_GAIN_TABLE_CLOCK | AD9361_RECEIVER_SELECT_RX1); /* clear write bit */
+    ad9361_spi_write(AD9361_REG_GAIN_TABLE_READ_DATA1, 0u); /* dummy write, delay */
+    ad9361_spi_write(AD9361_REG_GAIN_TABLE_READ_DATA1, 0u); /* dummy write, delay */
+    ad9361_spi_write(AD9361_REG_GAIN_TABLE_CONFIG, 0u); /* stop gain table clock */
+
+    ad9361_spi_write(AD9361_REG_RX1_MANUAL_DIGITALFORCED_GAIN, 0u); /* digital gain index unused */
+}
+
+/*
+ * RX gain control mode select: 0=MGC (manual), 1=fast-attack AGC, 2=slow-
+ * attack AGC, 3=hybrid AGC (ADI's rf_gain_ctrl_mode enum). RX2 mirrors
+ * RX1's mode (RX2 unused). Only the mode-select bits are touched here --
+ * a real tuned AGC response also needs step-size/overload-threshold
+ * registers (ADI's ad9361_gc_setup()) this project has never configured,
+ * so picking an AGC mode selects the *behavior* but not a calibrated one;
+ * that's a separate, bigger one-time setup if ever needed. Sufficient on
+ * its own for manual gain testing and for toggling back to whatever AGC
+ * mode was last selected.
+ */
+static void ad9361_set_rx_gain_mode(uint8_t mode)
+{
+    uint8_t m = mode & 0x3u;
+    ad9361_spi_write(AD9361_REG_AGC_CONFIG_1, (uint8_t)(m | (uint8_t)(m << 2)));
+}
+
+/*
+ * Manual gain table index, 0-76 (~ -1dB..73dB for this band). Only takes
+ * effect while in MGC mode -- ADI's own driver (ad9361_set_rx_gain())
+ * refuses this write outside MGC, since the AGC engine drives the same
+ * index register itself in every other mode.
+ */
+static void ad9361_set_rx_manual_gain(uint8_t idx)
+{
+    if (idx > (uint8_t)(AD9361_GAIN_TABLE_SIZE - 1u)) { idx = (uint8_t)(AD9361_GAIN_TABLE_SIZE - 1u); }
+    ad9361_spi_rmw(AD9361_REG_RX1_MANUAL_LMT_FULL_GAIN, 0x7Fu, 0u, idx);
+}
+
+/*
  * One-time AD9361 bring-up shared by test and mission mode: release the
  * control pins, lock the BBPLL, configure the LVDS parallel port, lock
- * the RX LO synth (98MHz), tune RX_DATA_DELAY, force ALERT->RX. Runs once
- * at boot. Does NOT set the RX sample rate/clock-divider chain -- see
- * bring_up_uart.txt, kept manual since it's still an actively-tuned knob.
+ * the RX LO synth (98MHz), set the RX sample-rate chain, load the RX gain
+ * table and default to manual gain, tune RX_DATA_DELAY, force ALERT->RX.
+ * Runs once at boot.
  */
 static void ad9361_common_init(void)
 {
@@ -500,14 +876,52 @@ static void ad9361_common_init(void)
     ad9361_spi_write(AD9361_REG_PARALLEL_PORT_CONF_2, 0x00u); /* no inversions (explicit, not assumed default) */
     ad9361_spi_write(AD9361_REG_PARALLEL_PORT_CONF_3, 0x10u); /* LVDS mode enabled */
 
+    ad9361_spi_write(AD9361_REG_INPUT_SELECT, AD9361_INPUT_SELECT_RX1A_RX2A_BALANCED);
+
     ad9361_rx_lo_synth_98mhz();
+
+    /* RX sample-rate chain: target RX_SAMPL_FREQ (= dsp_clk, confirmed
+     * 1:1 -- see README.md) = 30MHz, RX FIR bypassed. BBPLL_DIVIDER=5
+     * -> ADC_CLK = 960MHz>>5 = 30MHz exactly; DEC3/RHB2_EN/RHB1_EN/
+     * RX_FIR_ENABLE_DECIMATION all cleared (0x40 preserves only
+     * RX_CHANNEL_ENABLE=RX_1) so nothing downstream of ADC_CLK divides
+     * further. Previously left as a manual UART knob (never applied),
+     * which is why dsp_clk had been running at the chip's unconfigured
+     * default (~7.5MHz) the whole time -- see project history for how
+     * that was diagnosed. Hardware-confirmed 2026-09-13 via the CIC-
+     * decimated sample-stream rate (rate_counter.py): dsp_clk lands
+     * dead-on 30MHz (9.6MB/s) -- an earlier reading that session
+     * (~28.23MHz-equivalent, 9.035MB/s) turned out to be measured after
+     * a string of live-ELF-only JTAG reloads that never actually reset
+     * the AD9361 (REG_AD9361_PINS/RESETB is PL-fabric state, untouched
+     * by dow+con -- see project memory), not a genuine BBPLL/REFCLK
+     * tolerance limit. Trust dsp_clk/rate measurements only after a real
+     * bitstream reprogram or power cycle. constraints.xdc's rx_clk
+     * period (33.33ns/30MHz) matches this confirmed rate directly, not
+     * just as conservative margin. Note RX_DATA_DELAY below was
+     * originally hand-tuned at the old, wrong sample rate -- may need
+     * re-sweeping now that dsp_clk actually changes by ~4x. */
+    ad9361_spi_rmw(AD9361_REG_BBPLL, 0x7u, 0u, 5u);
+    ad9361_spi_write(AD9361_REG_RX_ENABLE_FILTER_CTRL, 0x40u);
+
+    ad9361_rx_gain_table_load();
+    ad9361_set_rx_gain_mode(0u); /* default: manual gain, so mission mode boots to a
+                                   * known state rather than an unconfigured/undefined
+                                   * AGC response -- override live via CMD_DEV_GAIN */
+    ad9361_set_rx_manual_gain(60u); /* moderate default (~57dB); live-adjustable */
+
     ad9361_spi_write(AD9361_REG_RX_CLOCK_DATA_DELAY, AD9361_RX_DATA_DELAY_DEFAULT);
     ad9361_spi_write(AD9361_REG_ENSM_CONFIG_1,
                       AD9361_LEVEL_MODE | AD9361_TO_ALERT | AD9361_FORCE_RX_ON); /* ALERT -> real RX */
 
-    /* Deliberately stops here: RX sample rate (REG_BBPLL +
-     * REG_RX_ENABLE_FILTER_CTRL) stays a runtime UART knob, not baked in
-     * -- see bring_up_uart.txt. */
+    /* MGC settle pulse -- see the register block above for why. */
+    {
+        uint8_t tmp = ad9361_spi_read(AD9361_REG_SMALL_LMT_OVERLOAD_THRESH);
+        ad9361_spi_write(AD9361_REG_SMALL_LMT_OVERLOAD_THRESH,
+                          (tmp & AD9361_SMALL_LMT_OVERLOAD_THRESH_MASK) | AD9361_FORCE_PD_RESET_RX1);
+        ad9361_spi_write(AD9361_REG_SMALL_LMT_OVERLOAD_THRESH,
+                          tmp & AD9361_SMALL_LMT_OVERLOAD_THRESH_MASK);
+    }
 }
 
 /* Set once test mode is actually active (and cleared on mission mode) --
@@ -671,6 +1085,18 @@ static uint8_t dispatch_command(const uint8_t *req, uint32_t *reply)
             volatile uint32_t *reg = (volatile uint32_t *)(NOTIF_AXI_BASE + addr);
             *reply = *reg;
             has_reply = 1u;
+        }
+    } else if (dev == CMD_DEV_RXLO) {
+        if (rw & CMD_RW_WRITE) {
+            ad9361_rx_lo_synth_set(data);
+        }
+    } else if (dev == CMD_DEV_GAIN) {
+        if (rw & CMD_RW_WRITE) {
+            if (addr == 0x00u) {
+                ad9361_set_rx_gain_mode((uint8_t)(data & 0xFFu));
+            } else if (addr == 0x04u) {
+                ad9361_set_rx_manual_gain((uint8_t)(data & 0xFFu));
+            }
         }
     } else if (dev == CMD_DEV_SYS) {
         if (rw & CMD_RW_WRITE) {

@@ -865,6 +865,10 @@ for the always-on part, `bring_up_uart.txt` for the still-manual part):
    ~29.8 MHz — matching the two configured targets almost exactly. This
    also settled that `dsp_clk` (the recovered LVDS clock) equals
    `RX_SAMPL_FREQ` directly, 1:1, not some multiple of it.
+   **2026-09-13: this configuration regressed and was rediscovered from
+   scratch** -- see "`dsp_clk` sample-rate regression" further down.
+   `BBPLL/32` is now baked into `ad9361_common_init()` permanently,
+   not a manual knob.
 5. **LVDS parallel port** — `REG_PARALLEL_PORT_CONF_1/2/3` (IQ swap,
    pulse-mode frame, 1R1T timing, LVDS mode).
 6. **Mode-specific ENSM/test config** — see below.
@@ -996,12 +1000,21 @@ mode-specific vs. still being actively tuned:
   be common to both modes (see "AD9361 RX digital bring-up" above). Both
   mode functions now hold only their genuinely mode-specific step: arm
   BIST, or clear it.
-- **RX clock-divider chain** — deliberately *not* automated, even though
-  it's common to both modes. It's still an actively-tuned knob (two known
-  configs, more likely coming as the real sample-rate needs get decided);
-  baking a specific rate into `ad9361_common_init()` would mean a full
-  rebuild+reupload cycle every time it changes instead of one UART
-  command. Stays in `bring_up_uart.txt`.
+- **RX clock-divider chain** — 2026-09-13: now baked into
+  `ad9361_common_init()` too (`REG_BBPLL`/`REG_RX_ENABLE_FILTER_CTRL`,
+  `BBPLL_DIVIDER=5`, RX FIR bypassed, target `RX_SAMPL_FREQ`=`dsp_clk`
+  = 30MHz). Previously left as a manual `bring_up_uart.txt` knob on the
+  reasoning that it was still being actively tuned -- in practice this
+  meant it was *never actually applied*, so `dsp_clk` silently ran at
+  the AD9361's un-configured default (~7.5MHz, confirmed two independent
+  ways: the CIC-decimated sample-stream data rate, and a `dsp_clk`-domain
+  LED counter -- see "dsp_clk sample-rate regression" below) for the
+  entire time the digital demod chain (`cic_dec.sv`/`fir_time_multiplexed.sv`/
+  `dsp.sv`) was being built and timing-budgeted against an assumed 30MHz.
+  **Not yet re-verified on hardware at this exact setting** -- confirm
+  with the same LED technique before trusting it, and expect
+  `RX_DATA_DELAY` (hand-tuned at the old, wrong rate) may need
+  re-sweeping now that `dsp_clk` changes by ~4x.
 
 `bring_up_uart.txt` is the manual-command reference/scratch file — kept
 lean on purpose after the register derivation above was folded into
@@ -1025,6 +1038,56 @@ binary UART data, not a hardware or RTL bug. No RTL changes were needed
 to fix it. Worth remembering if a similarly "impossible" single-byte
 readback anomaly shows up again — check the host-side tooling before
 suspecting the hardware.
+
+### `dsp_clk` sample-rate regression, and how it was found again
+
+2026-09-13. The `BBPLL/32 -> 30MHz` RX clock-divider configuration above
+was derived, hardware-confirmed, and documented once already (this same
+README section) -- but it lived only as a *manual* `bring_up_uart.txt`
+reference, never applied by `ad9361_common_init()`, on the reasoning
+that the sample rate was still being actively tuned. In practice that
+meant it was never actually written on any real boot: `dsp_clk` silently
+ran at the AD9361's un-configured default the entire time the digital
+FM demod chain (`cic_dec.sv`, `fir_time_multiplexed.sv`, `dsp.sv`) was
+designed and timing-budgeted against an assumed ~30MHz -- and separately,
+`bring_up_uart.txt` itself lost the actual register values for both
+known-good options across later rewrites of that file (it isn't
+git-tracked; `private/` is gitignored), leaving no working reference to
+reapply them by hand either.
+
+First real symptom: the sample-stream data rate reported by
+`pc_console.py` (2.4MB/s) was exactly 4x lower than the CIC's decimate-
+by-25 math predicted at 30MHz. Two follow-up experiments each looked
+individually ambiguous -- an eye-diagram samples-per-period check turned
+out to be algebraically invariant to `dsp_clk`'s absolute rate (it only
+validated the NCO/decimator math, which was correct); a test nulling the
+AD9361's internal BIST tone via the NCO landed at exactly half the
+expected mixing frequency, which briefly looked like it might implicate
+RX2 (time-multiplexed with RX1, plausible if enabled) -- directly ruled
+out by reading `REG_RX_ENABLE_FILTER_CTRL` back over SPI and decoding
+`RX_CHANNEL_ENABLE` against ADI's own driver header (`RX_1=1`, value
+confirmed). The actual reconciliation came from re-deriving `ad3961_if_rx.sv`'s
+R1-mode frame-decode timing directly from the RTL: it produces one valid
+sample every 2 `dsp_clk` cycles, not the 4 an earlier (2RX-mode-derived)
+assumption had used -- once corrected, the "half rate" tone result
+matched exactly.
+
+The rate question was only actually settled by direct physical
+measurement: a `dsp_clk`-domain counter driving `gpio_3p3_2` (temporarily
+repurposed from `adc_status`), hand-timed at 50 blinks in 54.76s
+(~0.913Hz) against two predicted rates (~3.55Hz if `dsp_clk`~29.8MHz,
+~0.89Hz if ~7.5MHz) -- confirming the slow one. That, plus the live
+`REG_RX_ENABLE_FILTER_CTRL` readback (`0x5F`, decoding to `DEC3`/`RHB2`/
+`RHB1`/`RX_FIR` all *active*, not bypassed -- the AD9361's genuinely
+un-configured default, not RX2 or anything else) gave a fully
+self-consistent picture: every stage of the clock chain accounted for,
+landing exactly on the measured ~7.5MHz. `BBPLL/32` is now baked into
+`ad9361_common_init()` (see "Software: common bring-up automated" above)
+so this can't silently regress the same way again; `constraints.xdc`'s
+`rx_clk` period should be corrected to match once this exact
+configuration is re-verified on hardware (it currently reads a
+now-superseded ~29.8MHz-derived value, itself a correction of the
+original never-real 250MHz).
 
 ### Sample counters: peripheral built, CDC strategy decided, real producer still pending
 

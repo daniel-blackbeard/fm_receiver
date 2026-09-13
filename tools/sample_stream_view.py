@@ -60,7 +60,7 @@ from collections import deque
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from matplotlib.widgets import TextBox
+from matplotlib.widgets import TextBox, RadioButtons
 
 BIND_IP = "0.0.0.0"
 SAMPLE_PORT = 5556           # SAMPLE_DEST_PORT, sw/eth0.h
@@ -112,7 +112,14 @@ class SampleReceiver:
                 # mis-unpack it as sample data.
                 self.packets_dropped += 1
                 continue
-            samples = struct.unpack(f"<{SAMPLES_PER_PACKET * 4}h", data)
+            # Always unsigned ('H') -- the raw bit pattern, untouched.
+            # signed/unsigned is a *display* cast (see cast_signed()
+            # below), not a receipt-time choice: applying it here would
+            # bake whichever interpretation was active at receipt into
+            # the stored buffer, so toggling mid-stream would leave old-
+            # and new-interpretation samples mixed together until the
+            # whole buffer cycled out.
+            samples = struct.unpack(f"<{SAMPLES_PER_PACKET * 4}H", data)
             with self.lock:
                 self.buffers["ch1_q"].extend(samples[0::4])
                 self.buffers["ch1_i"].extend(samples[1::4])
@@ -122,10 +129,20 @@ class SampleReceiver:
                 self.bytes_received += len(data)
 
     def snapshot(self):
-        """{name: np.ndarray}, oldest-to-newest; may be shorter than
-        fft_size until enough packets have arrived."""
+        """{name: np.ndarray}, oldest-to-newest, raw unsigned (0-65535);
+        may be shorter than fft_size until enough packets have arrived.
+        Apply cast_signed() at display time for the signed view."""
         with self.lock:
             return {name: np.fromiter(buf, dtype=np.float64) for name, buf in self.buffers.items()}
+
+
+def cast_signed(arr):
+    """Reinterprets a raw unsigned (0-65535) array as two's complement
+    16-bit signed (-32768..32767) -- the real wire format. A pure display
+    cast, applied fresh at every redraw so it's always consistent across
+    every consumer of a SampleReceiver's snapshot(), never baked into the
+    stored buffer itself."""
+    return np.where(arr >= 32768, arr - 65536, arr)
 
 
 def main():
@@ -181,12 +198,29 @@ def main():
     rate_box.on_submit(on_rate_submit)
     apply_rate(SAMPLE_RATE_HZ)
 
+    # Reinterprets the same raw 16-bit wire bits as signed (two's
+    # complement, the real format) or unsigned -- a diagnostic toggle for
+    # comparing which one actually matches what's on the wire, not a
+    # "pick whichever looks right" setting. Applied fresh at every
+    # redraw (see cast_signed()), not baked into the receiver's stored
+    # buffer, so it takes effect immediately and uniformly.
+    signed_ax = fig.add_axes((0.56, 0.88, 0.12, 0.1))
+    signed_radio = RadioButtons(signed_ax, ("Signed", "Unsigned"), active=0)
+    state["signed"] = True
+
+    def on_signed_change(label):
+        state["signed"] = (label == "Signed")
+
+    signed_radio.on_clicked(on_signed_change)
+
     def update(_frame):
         data = recv.snapshot()
         for name, line in lines.items():
             buf = data[name]
             if len(buf) < fft_size:
                 continue
+            if state["signed"]:
+                buf = cast_signed(buf)
             spectrum = np.fft.rfft(buf[-fft_size:] * window)
             line.set_ydata(20 * np.log10(np.abs(spectrum) + 1e-9))
         fig.suptitle(

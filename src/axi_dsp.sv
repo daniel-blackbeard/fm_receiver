@@ -58,6 +58,7 @@ module axi_dsp (
     // ---------------- DSP domain ----------------
     logic [4:0] addr;
     logic dsp_ready;
+    logic i_valid_old;
     logic dsp_flag, dsp_ff1_flag;
     logic former_bank;
     logic fpga_flag; // declared here (moved up from the FPGA-domain block
@@ -75,8 +76,9 @@ module axi_dsp (
             dsp_flag     <= '0;
             dsp_ff1_flag <= '0;
             former_bank  <= '0;
+            i_valid_old  <= '0;
         end else begin
-            if(i_valid) begin
+            if(i_valid & ~i_valid_old) begin
                 addr         <= addr + 5'b1;
                 buffer[addr] <= i_data;
                 former_bank  <= addr[4];
@@ -89,6 +91,7 @@ module axi_dsp (
             // sample every dsp_clk cycle, not just once per i_valid.
             dsp_ff1_flag <= fpga_flag;
             dsp_flag     <= dsp_ff1_flag;
+            i_valid_old  <= i_valid;
         end
     end
 

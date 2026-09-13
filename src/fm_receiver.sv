@@ -56,9 +56,15 @@ wire         fclk0_rstn;   // active-low; unused for now — free-running counte
 logic        dsp_clk;      // ad3961_if_rx's recovered RX clock -- declared here (rather than
                             // down by its instantiation) so it's available to axi_cdc_status,
                             // instantiated earlier in the file
-logic [15:0] data_rx0_i, data_rx0_q, data_rx1_i, data_rx1_q; // decimated I/Q, see "Glue logic" below --
+logic signed [15:0] data_rx0_i, data_rx0_q, data_rx1_i, data_rx1_q; // decimated I/Q, see "Glue logic" below --
                             // declared here so axi_dsp's instantiation (earlier in the file) can use them
-logic        dec_done;      // decimation-stage pulse, same forward-declaration reasoning as above
+logic        dec_done;      // decimation-window-complete flag, same forward-declaration reasoning
+                            // as above -- can hold high across multiple dsp_clk cycles now that
+                            // dec_counter only advances on adc_valid, see "Glue logic" below
+
+wire        dsp_o_valid;   // dsp.sv's FIR-done pulse; same forward-declaration reasoning as
+wire [63:0] dsp_debug;     // above -- axi_dsp's instantiation (earlier in the file) needs these,
+                            // the real dsp module instance is down by ad3961_if_rx
 
 // M_AXI_GP0 — PS7's AXI3 master into the PL. Internal wires, not top-level
 // ports: this bus never leaves the chip. It goes straight into axi_if
@@ -232,6 +238,14 @@ assign enable         = regmap[64];
 assign txnrx          = regmap[65];
 assign gpio_resetb    = regmap[66];
 
+// RM 0x08 bit8 (byte1, bits[15:8] reserved for this kind of control):
+// silences axi_dsp by holding its fclk0-domain reset asserted, so its
+// AXI3 burst-master FSM produces zero DDR write traffic while set --
+// for isolating GEM RX delivery from axi_dsp DMA load. Same clock domain
+// as regmap itself, so no CDC needed.
+wire axi_dsp_silence = regmap[72];
+wire axi_dsp_rstb_fpga = fclk0_rstn & ~axi_dsp_silence;
+
 // adc_r1_mode_ps is registered here in fclk0, NOT a plain assign from
 // regmap[67] directly -- the dsp_clk-domain CDC synchronizer taps this
 // register instead of the raw regmap wire, so our cross-domain read
@@ -244,6 +258,21 @@ assign gpio_resetb    = regmap[66];
 always_ff @( posedge fclk0 ) begin
     adc_r1_mode_ps <= regmap[67];
 end
+
+// RM 0x0C: dsp.sv's NCO phase_step, full 32-bit word. Crossed into
+// dsp_clk with a single plain register -- NOT a proper 2-flop/handshake
+// synchronizer -- an accepted, deliberate CDC risk (see the matching
+// set_false_path in constraints.xdc): at worst a torn/glitched
+// phase_step value perturbs the NCO's frequency for one dsp_clk cycle,
+// self-correcting the next cycle once the crossing settles. No FSM
+// state or accumulator can be corrupted by it, unlike every other
+// crossing in this file, which is why this one gets the shortcut and
+// they don't. Reads as 0 (no NCO rotation) until firmware writes a real
+// value here -- axi_registers' own reset zeroes regmap, so this isn't a
+// simulation-only concern.
+wire [31:0] phase_step_ps = regmap[127:96];
+logic [31:0] phase_step_dsp;
+always_ff @(posedge dsp_clk) phase_step_dsp <= phase_step_ps;
 
 always_ff @( posedge fclk0 ) begin
     counter <= counter + 32'b1;
@@ -400,13 +429,20 @@ axi_dsp u_axi_dsp (
     .clk_fpga  (fclk0),
     .clk_dsp   (dsp_clk),
     .rstb_dsp  (rstb_dsp_sync),
-    .rstb_fpga (fclk0_rstn),
+    .rstb_fpga (axi_dsp_rstb_fpga),
 
-    .i_valid (dec_done),           // placeholder -- no real DSP sample pipeline feeds this yet
-    .ch0_i (data_rx0_i),            // placeholder -- real RX0 I data not wired yet
-    .ch0_q (data_rx0_q),            // placeholder -- real RX0 Q data not wired yet
-    .ch1_i (data_rx1_i),            // placeholder -- real RX1 I data not wired yet
-    .ch1_q (data_rx1_q),            // placeholder -- real RX1 Q data not wired yet
+    // dsp.sv's FIR-done pulse and packed debug tap (see the dsp
+    // instantiation below the AD9361 RX interface) -- replaces the old
+    // placeholder decimator signals (data_rx0_i/q, data_rx1_i/q,
+    // dec_done are still computed further down, just no longer feed
+    // this). debug = {I_out_fir, Q_out_fir, I_out_fir, Q_out_fir}: ch0
+    // gets the real demod chain output, ch1 mirrors it (RX2/second
+    // channel isn't processed yet).
+    .i_valid (dsp_o_valid),
+    .ch0_i (dsp_debug[63:48]),
+    .ch0_q (dsp_debug[47:32]),
+    .ch1_i (dsp_debug[31:16]),
+    .ch1_q (dsp_debug[15:0]),
 
     .awid    (s_axi_hp0_awid),
     .awaddr  (s_axi_hp0_awaddr),
@@ -688,17 +724,20 @@ axi_notifications #(
 );
 
 // AD9361 RX digital interface -- ad3961_if_rx's own recovered RX clock
-// (looped in from rx_clk_in_p/n) and decoded ADC samples. Nothing
-// downstream consumes these yet (no DSP chain built) -- wired through
-// as a complete, connected instance rather than dangling ports, ready
-// for whatever consumes it next.
+// (looped in from rx_clk_in_p/n) and decoded ADC samples. Feeds the
+// digital demod chain (dsp.sv, instantiated below) directly.
 logic        adc_r1_mode;
 logic        adc_r1_mode_dsp;
 logic        adc_valid;
-logic [11:0] adc_data_i1;
-logic [11:0] adc_data_q1;
-logic [11:0] adc_data_i2;
-logic [11:0] adc_data_q2;
+// signed: adc_data_i1 etc. are operands in data_rx0_i's accumulation
+// (below) alongside the signed 16-bit accumulator -- SystemVerilog
+// evaluates a mixed signed/unsigned expression entirely as unsigned if
+// any operand is unsigned, so leaving these unsigned silently defeated
+// data_rx0_i's own signed declaration on every add.
+logic signed [11:0] adc_data_i1;
+logic signed [11:0] adc_data_q1;
+logic signed [11:0] adc_data_i2;
+logic signed [11:0] adc_data_q2;
 logic        adc_status;
 logic [11:0] dbg_rx_data;
 logic [3:0]  dbg_rx_frame_s;
@@ -735,6 +774,31 @@ ad3961_if_rx u_ad3961_if_rx (
     .dbg_rx_frame_s  (dbg_rx_frame_s)
 );
 
+// Digital demod chain (mixer -> cic_dec -> fir_time_multiplexed, see
+// dsp.sv) -- first real hardware sanity-check wiring, 2026-09-13.
+// o_data1/o_data2 intentionally left unconnected: no discriminator
+// built yet, plenty more processing between here and a real audio/data
+// output. o_valid/debug instead feed axi_dsp below (in place of the old
+// placeholder decimator signals), so the FIR's actual output can be
+// observed over the existing, already hardware-verified axi_dsp -> DDR
+// -> GEM -> UDP sample-stream pipeline (pc_console.py's FFT tab) without
+// building new debug infrastructure. dsp_o_valid/dsp_debug forward-
+// declared up near dec_done/data_rx0_i, same reasoning.
+dsp u_dsp (
+    .clk        (dsp_clk),
+    .rstb       (rstb_dsp_sync),
+    .valid      (adc_valid),
+    .rx_data_i1 (adc_data_i1),
+    .rx_data_q1 (adc_data_q1),
+    .rx_data_i2 (adc_data_i2),
+    .rx_data_q2 (adc_data_q2),
+    .phase_step (phase_step_dsp),
+    .o_data1    (),
+    .o_data2    (),
+    .o_valid    (dsp_o_valid),
+    .debug      (dsp_debug)
+);
+
 // Glue logic: decimation stage x8 (declarations moved up to axi_dsp's
 // own declaration block above -- same reasoning as dsp_clk's forward
 // declaration: xvlog requires declare-before-use even across a module
@@ -742,24 +806,47 @@ ad3961_if_rx u_ad3961_if_rx (
 // synth_design tolerates the original order fine, xvlog doesn't)
 logic  [2:0] dec_counter;
 
+// Whole block gated on adc_valid, not just the accumulate step: dec_counter
+// itself must only advance on real samples, or its wrap (dec_done) lands on
+// an arbitrary dsp_clk cycle instead of the 8th real one -- letting stale
+// leftovers from the previous window bleed into the next. One guard instead
+// of three repeated ones. dec_done can now stay high for several dsp_clk
+// cycles while waiting on the next real sample (no longer a guaranteed
+// single-cycle pulse) -- axi_dsp's own i_valid edge-detect already handles
+// that.
 always_ff @( posedge dsp_clk ) begin
-    dec_counter <= dec_counter + 3'b1;
-    if(dec_done) begin
-        data_rx0_i <= adc_data_i1;
-        data_rx0_q <= adc_data_q1;
-        data_rx1_i <= adc_data_i2;
-        data_rx1_q <= adc_data_q2;
-    end else begin
-        data_rx0_i <= data_rx0_i + adc_data_i1;
-        data_rx0_q <= data_rx0_q + adc_data_q1;
-        data_rx1_i <= data_rx1_i + adc_data_i2;
-        data_rx1_q <= data_rx1_q + adc_data_q2;
+    if (adc_valid) begin
+        dec_counter <= dec_counter + 3'b1;
+        if (dec_done) begin
+            data_rx0_i <= adc_data_i1;
+            data_rx0_q <= adc_data_q1;
+            data_rx1_i <= adc_data_i2;
+            data_rx1_q <= adc_data_q2;
+        end else begin
+            data_rx0_i <= data_rx0_i + adc_data_i1;
+            data_rx0_q <= data_rx0_q + adc_data_q1;
+            data_rx1_i <= data_rx1_i + adc_data_i2;
+            data_rx1_q <= data_rx1_q + adc_data_q2;
+        end
     end
 end
 
 assign dec_done = dec_counter == 3'b0;
 
-assign gpio_3p3_2 = adc_status;
+// TEMPORARY diagnostic (2026-09-13): gpio_3p3_2 reassigned from
+// adc_status to a free-running dsp_clk-domain counter bit, giving a
+// direct, assumption-free physical readout of dsp_clk's real frequency
+// -- sidesteps every layer of software/AXI/UDP that the other rate
+// experiments went through. Bit 22 -> full blink period 2^23 cycles:
+// ~3.55Hz (fast flicker) if dsp_clk really is ~29.8MHz, ~0.89Hz (one
+// clear blink per ~1.1s) if it's actually ~7.5MHz, matching the
+// decimated-sample-rate-derived hypothesis. Revert to adc_status once
+// this is settled.
+logic [31:0] dsp_clk_counter;
+always_ff @(posedge dsp_clk) begin
+    dsp_clk_counter <= dsp_clk_counter + 32'b1;
+end
+assign gpio_3p3_2 = dsp_clk_counter[22];
 
 logic [31:0] dsp_counter;
 always_ff @( posedge dsp_clk ) begin
