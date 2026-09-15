@@ -43,8 +43,11 @@ pyserial (`pip install pyserial` or, on this project's MSYS2 UCRT Python,
 Run: python pc_console.py
 """
 
+import os
+import queue
 import socket
 import struct
+import threading
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -53,6 +56,27 @@ import numpy as np
 import serial
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from scipy import signal as scipy_signal
+
+# sounddevice's ctypes.util.find_library() lookup doesn't honor
+# os.add_dll_directory() on Windows -- it needs the DLL's directory on
+# PATH itself (confirmed 2026-09-15: add_dll_directory alone still
+# raised "PortAudio library not found"). Prepend UCRT64's bin/ (where
+# `pacman -S mingw-w64-ucrt-x86_64-python-sounddevice` puts
+# libportaudio.dll) before importing, so this works regardless of
+# whether the launching shell already has it on PATH. Optional feature:
+# if sounddevice genuinely isn't installed, the audio checkbox below
+# just stays disabled rather than crashing the whole console.
+try:
+    _ucrt_bin = r"C:\msys64\ucrt64\bin"
+    if os.path.isdir(_ucrt_bin) and _ucrt_bin not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _ucrt_bin + os.pathsep + os.environ.get("PATH", "")
+    import sounddevice as sd
+    AUDIO_AVAILABLE = True
+except Exception as _exc:  # noqa: BLE001 -- genuinely any failure here should just disable audio, not crash the console
+    sd = None
+    AUDIO_AVAILABLE = False
+    _AUDIO_IMPORT_ERROR = str(_exc)
 
 # Reuse the sample-stream receiver/unpacking logic verbatim rather than
 # duplicating it -- see sample_stream_view.py's own docstring for the full
@@ -64,6 +88,31 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 # instead of it, freely.
 from sample_stream_view import (
     SampleReceiver, CHANNEL_NAMES, SAMPLE_PORT, SAMPLE_RATE_HZ, DEFAULT_FFT_SIZE, cast_signed,
+)
+
+# --- Mono (L+R) audio demodulation (2026-09-15) ----------------------------
+#
+# ch0_i currently carries mpx_data_desc, dsp.sv's MPX composite signal
+# already decimated to 240kHz by mpx_decimator.sv (see src/dsp.sv). This
+# low-pass-filters + decimates that further, in software, to recover
+# mono audio -- deliberately NOT an RTL change: every RTL reload risks
+# the DAP wedge (see project memory, jtag_dap_wedge_after_live_reprogram.md),
+# and this needs no new hardware, just reading the same debug bus already
+# being streamed.
+#
+# Same filter spec as src/tools/gen_mono_lpf_taps.py's RTL design
+# (15kHz passband -- standard FM mono bandwidth, 18kHz stopband -- clears
+# the 19kHz pilot with margin) but computed directly in float here, no
+# fixed-point quantization concerns since this never touches hardware.
+AUDIO_IN_RATE_HZ = 240_000    # mpx_data_desc's rate (post mpx_decimator.sv)
+AUDIO_DECIM = 5                # -> 48kHz, a standard audio output rate
+AUDIO_OUT_RATE_HZ = AUDIO_IN_RATE_HZ // AUDIO_DECIM
+AUDIO_PASSBAND_HZ = 15_000
+AUDIO_STOPBAND_HZ = 18_000
+AUDIO_LPF_TAPS = 96
+AUDIO_LPF_B = scipy_signal.remez(
+    AUDIO_LPF_TAPS, [0, AUDIO_PASSBAND_HZ, AUDIO_STOPBAND_HZ, AUDIO_IN_RATE_HZ / 2],
+    [1, 0], fs=AUDIO_IN_RATE_HZ,
 )
 
 # --- Protocol constants (mirrors sw/eth0.h / sw/main.c exactly) -----------
@@ -125,6 +174,17 @@ GAIN_MODES = {
     "Hybrid AGC": 3,
 }
 GAIN_LEVEL_MAX = 76  # AD9361_GAIN_TABLE_SIZE-1, sw/main.c -- ~73dB at this index for the 0-1.3GHz band
+
+# PLL lock status -- raw AD9361 SPI register reads (via CMD_DEV_SPI, same
+# path the generic Send command panel uses), not anything sw/main.c
+# exposes specially. Added 2026-09-14 to have a direct, on-demand answer
+# ("is the chip's own PLL actually unlocked right now") the next time the
+# sample-stream rate collapses mid-session, instead of re-theorizing from
+# scratch -- see ad9361.h for both bit definitions.
+PLL_LOCK_REGS = {
+    "BBPLL_LOCK":  (0x05E, 0x80),  # REG_CH_1_OVERFLOW bit7
+    "RX VCO_LOCK": (0x247, 0x02),  # REG_RX_CP_OVERRANGE_VCO_LOCK bit1
+}
 
 # RX LO tuning range accepted by ad9361_rx_lo_synth_set() (sw/main.c) --
 # a wider guard band than the actual FM broadcast band (78-108MHz-ish),
@@ -367,6 +427,12 @@ class ConsoleApp:
         self.gain_status_var = tk.StringVar(value="")
         ttk.Label(gain_frame, textvariable=self.gain_status_var).grid(row=1, column=0, columnspan=5, sticky="w", padx=4)
 
+        pll_frame = ttk.LabelFrame(f, text="PLL lock status (on demand -- not polled automatically)")
+        pll_frame.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Button(pll_frame, text="Check now", command=self._on_check_pll_lock).grid(row=0, column=0, padx=4, pady=4)
+        self.pll_lock_var = tk.StringVar(value="Not checked yet")
+        ttk.Label(pll_frame, textvariable=self.pll_lock_var).grid(row=0, column=1, sticky="w", padx=8)
+
         send_frame = ttk.LabelFrame(f, text="Send command")
         send_frame.pack(fill="x", padx=8, pady=8)
 
@@ -471,6 +537,23 @@ class ConsoleApp:
         self.gain_status_var.set(f"Manual level: {level}")
         self._log(f"GAIN LEVEL -> {level}")
 
+    def _on_check_pll_lock(self):
+        dev = DEVICES["SPI (AD9361)"]
+        results = []
+        try:
+            for name, (addr, mask) in PLL_LOCK_REGS.items():
+                cmd = self.link.pack_command(dev, CMD_RW_READ, addr, 0)
+                (val,) = self.link.send_commands([cmd], expected_replies=1)
+                locked = bool(val & mask)
+                results.append(f"{name}={'LOCKED' if locked else 'UNLOCKED'} (0x{val:02X})")
+        except (OSError, socket.timeout) as exc:
+            self.pll_lock_var.set(f"ERROR: {exc}")
+            self._log(f"ERROR checking PLL lock: {exc}")
+            return
+        summary = "  ".join(results)
+        self.pll_lock_var.set(summary)
+        self._log(f"PLL LOCK CHECK -> {summary}")
+
     def _on_device_change(self, _event=None):
         # SYS is write-only and never replies -- reading it is meaningless,
         # so just steer the user away from it rather than sending a
@@ -559,6 +642,15 @@ class ConsoleApp:
         self.sample_recv = None       # SampleReceiver, only while listening
         self.sample_after_id = None   # root.after() handle for the redraw loop
 
+        # Audio pipeline state (2026-09-15) -- see _on_audio_toggle()/
+        # _audio_worker(). audio_queue is created once and handed to
+        # whatever SampleReceiver exists at the moment audio gets
+        # enabled (see set_audio_queue() on the receiver side); the
+        # worker thread itself only runs while audio_enabled_var is set.
+        self.audio_queue = queue.Queue(maxsize=200)  # ~200 packets worth --a few seconds' slack before dropping
+        self._audio_thread = None
+        self._audio_stop = threading.Event()
+
         ctrl = ttk.Frame(f)
         ctrl.pack(fill="x", padx=8, pady=8)
         self.sample_status_var = tk.StringVar(value="Not listening")
@@ -596,6 +688,22 @@ class ConsoleApp:
                          value="signed").pack(side="left")
         ttk.Radiobutton(ctrl, text="Unsigned", variable=self.sample_signed_var,
                          value="unsigned").pack(side="left")
+
+        # Audio (2026-09-15): off by default on purpose -- opening this
+        # tab (or starting the console at all) must never start making
+        # noise unprompted. See _on_audio_toggle() for the pipeline.
+        self.audio_enabled_var = tk.BooleanVar(value=False)
+        audio_check = ttk.Checkbutton(
+            ctrl, text=f"Audio (mono, {AUDIO_OUT_RATE_HZ//1000}kHz)",
+            variable=self.audio_enabled_var, command=self._on_audio_toggle,
+        )
+        audio_check.pack(side="left", padx=(16, 4))
+        if not AUDIO_AVAILABLE:
+            audio_check.state(["disabled"])
+            self.audio_status_var = tk.StringVar(value=f"Audio unavailable: {_AUDIO_IMPORT_ERROR}")
+        else:
+            self.audio_status_var = tk.StringVar(value="")
+        ttk.Label(ctrl, textvariable=self.audio_status_var).pack(side="left")
 
         fig = Figure(figsize=(9, 6))
         axes = fig.subplots(2, 2)
@@ -756,6 +864,12 @@ class ConsoleApp:
         if self.sample_after_id is not None:
             self.root.after_cancel(self.sample_after_id)
             self.sample_after_id = None
+        if self.audio_enabled_var.get():
+            # No receiver left to feed the audio queue -- turn audio off
+            # too rather than leave the worker thread spinning on an
+            # empty queue with nothing coming.
+            self.audio_enabled_var.set(False)
+            self._on_audio_toggle()
         if self.sample_recv is not None:
             self.sample_recv.stop()
             self.sample_recv = None
@@ -763,6 +877,92 @@ class ConsoleApp:
             btn.config(text="Start listening")
         self.sample_status_var.set("Not listening")
         self.eye_status_var.set("Not listening")
+
+    def _on_audio_toggle(self):
+        """Checkbox callback. Off by default -- see _build_sample_tab().
+        Starting audio doesn't touch the FPGA/firmware at all, just taps
+        the already-streaming ch0_i (mpx_data_desc) samples in software
+        (see the AUDIO_* constants' header comment for why: an RTL
+        change here would mean another live reprogram, risking the DAP
+        wedge, for something that doesn't need hardware at all)."""
+        if self.audio_enabled_var.get():
+            if self.sample_recv is None:
+                self.audio_status_var.set("Start listening first")
+                self.audio_enabled_var.set(False)
+                return
+            # Drop any backlog so audio starts from "now" rather than
+            # racing to catch up through several stale seconds first.
+            while True:
+                try:
+                    self.audio_queue.get_nowait()
+                except queue.Empty:
+                    break
+            self.sample_recv.set_audio_queue(self.audio_queue)
+            self._audio_stop.clear()
+            self._audio_thread = threading.Thread(target=self._audio_worker, daemon=True)
+            self._audio_thread.start()
+            self.audio_status_var.set("Playing")
+        else:
+            self._audio_stop.set()
+            if self.sample_recv is not None:
+                self.sample_recv.set_audio_queue(None)
+            self.audio_status_var.set("")
+
+    def _audio_worker(self):
+        """Runs on its own thread (never the Tk main thread) for the
+        whole time audio is enabled: drains audio_queue (ch0_i chunks,
+        32 raw unsigned samples per UDP packet), low-pass filters +
+        decimates to AUDIO_OUT_RATE_HZ, and streams it out via
+        sounddevice. Filter state (zi) and decimation phase are both
+        carried across chunks -- a 32-sample chunk isn't a multiple of
+        AUDIO_DECIM=5, so without phase tracking the decimation point
+        would silently reset every chunk boundary instead of continuing
+        smoothly (a real, audible artifact, not just a cosmetic one)."""
+        zi = np.zeros(len(AUDIO_LPF_B) - 1)
+        peak_est = 1.0
+        n_total = 0  # running count of filtered (pre-decimation) samples, for decimation phase
+        stream = None
+        try:
+            stream = sd.OutputStream(samplerate=AUDIO_OUT_RATE_HZ, channels=1, dtype="float32")
+            stream.start()
+            while not self._audio_stop.is_set():
+                try:
+                    chunk = self.audio_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                x = cast_signed(chunk).astype(np.float64)
+                y, zi = scipy_signal.lfilter(AUDIO_LPF_B, [1.0], x, zi=zi)
+
+                i_start = (-n_total) % AUDIO_DECIM
+                y_dec = y[i_start::AUDIO_DECIM]
+                n_total += len(y)
+                if y_dec.size == 0:
+                    continue
+
+                # Slowly-adapting peak normalization + hard safety clip:
+                # mpx_data's real-world amplitude was never calibrated to
+                # any fixed reference (see project memory,
+                # cordic_vector_hardware_stall.md's gain-chain
+                # investigation), so this is "don't be silent, don't
+                # clip harshly" -- not a precise loudness target. Decays
+                # slowly (0.999/chunk) so it doesn't audibly "pump" on
+                # every loud transient, but jumps up instantly to a new,
+                # louder peak so a sudden loud passage doesn't clip
+                # before the estimate catches up.
+                chunk_peak = float(np.max(np.abs(y_dec)))
+                peak_est = max(chunk_peak, peak_est * 0.999)
+                scale = 0.6 / peak_est if peak_est > 1e-6 else 0.0
+                out = np.clip(y_dec * scale, -1.0, 1.0).astype(np.float32)
+                stream.write(out.reshape(-1, 1))
+        except Exception as exc:  # noqa: BLE001 -- report and exit cleanly, don't take the console down
+            self.audio_status_var.set(f"Audio error: {exc}")
+        finally:
+            if stream is not None:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
 
     def _sample_update(self):
         if self.sample_recv is None:
@@ -816,9 +1016,11 @@ class ConsoleApp:
         )
         self.sample_canvas.draw_idle()
 
-        # Eye diagram stays disabled: it was the confirmed heavy contributor
-        # to receive-side packet loss (re-enable explicitly if needed, it
-        # will need `data` from the snapshot()/cast above, now restored).
+        # Disabled again 2026-09-15: heavy CPU/rate cost while tuning a
+        # real FM station and checking the FFT for MPX structure (pilot/
+        # stereo lobes) -- don't need the eye diagram for that, and it
+        # was draining the CPU. Re-enable if a raw time-domain debug read
+        # is needed again (see prior enable/disable history in this file).
         # self._eye_update(data)
 
         self.sample_after_id = self.root.after(200, self._sample_update)

@@ -52,6 +52,7 @@ up to a UDP socket at all.
 """
 
 import socket
+import queue
 import struct
 import sys
 import threading
@@ -91,6 +92,25 @@ class SampleReceiver:
         self.bytes_received = 0
         self._stop = False
         self._thread = None
+        # Opt-in, continuous (non-rolling-window) ch0_i sample feed for
+        # pc_console.py's audio pipeline (2026-09-15) -- separate from
+        # `buffers` above on purpose: those are fixed-size rolling
+        # windows for the FFT/eye-diagram displays (each redraw just
+        # wants "the last fft_size samples", repeats are fine), but audio
+        # needs every sample exactly once, in order, with no gaps -- a
+        # rolling snapshot would silently drop the vast majority of
+        # samples between polls. None (the default) means "don't
+        # bother" -- _run() skips the audio path entirely, no extra
+        # per-packet cost when nothing's listening for it.
+        self.audio_queue = None
+
+    def set_audio_queue(self, q):
+        """q: a queue.Queue (or None to disable) that will receive each
+        packet's raw ch0_i samples (unsigned, one small int array per
+        packet) as they arrive. Safe to call at any time, whether or not
+        the receiver thread is currently running."""
+        with self.lock:
+            self.audio_queue = q
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -121,12 +141,22 @@ class SampleReceiver:
             # whole buffer cycled out.
             samples = struct.unpack(f"<{SAMPLES_PER_PACKET * 4}H", data)
             with self.lock:
+                ch0_i = samples[3::4]
                 self.buffers["ch1_q"].extend(samples[0::4])
                 self.buffers["ch1_i"].extend(samples[1::4])
                 self.buffers["ch0_q"].extend(samples[2::4])
-                self.buffers["ch0_i"].extend(samples[3::4])
+                self.buffers["ch0_i"].extend(ch0_i)
                 self.packets_received += 1
                 self.bytes_received += len(data)
+                if self.audio_queue is not None:
+                    try:
+                        self.audio_queue.put_nowait(np.asarray(ch0_i, dtype=np.int64))
+                    except queue.Full:
+                        # Audio consumer fell behind -- drop this chunk
+                        # rather than block the receiver thread (packet
+                        # loss here would corrupt the FFT/eye buffers
+                        # too, audio glitching is the lesser harm).
+                        pass
 
     def snapshot(self):
         """{name: np.ndarray}, oldest-to-newest, raw unsigned (0-65535);

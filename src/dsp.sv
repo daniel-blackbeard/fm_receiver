@@ -22,6 +22,7 @@ logic signed [15:0] I_out_dec, Q_out_dec;
 logic signed [15:0] I_out_fir, Q_out_fir;
 
 logic strb, fir_done;
+logic signed [15:0] mpx_data, mpx_angle, mpx_angle_last;
 
 always_ff @(posedge clk) begin
     p1        <= rx_data_i1 * cos_s;
@@ -43,8 +44,8 @@ synth_core u_synth_nco(
 cic_dec u_cic_stage (
     .clk(clk),
     .rstb(rstb),
-    .rx_i(I_out_ext[24 -:12]),
-    .rx_q(Q_out_ext[24 -:12]),
+    .rx_i(I_out_ext[23 -:12]),
+    .rx_q(Q_out_ext[23 -:12]),
     .dec_i(I_out_dec),
     .dec_q(Q_out_dec),
     .strb(strb)
@@ -60,6 +61,36 @@ fir_time_multiplexed u_iq_fir(
   .done(fir_done)
 );
 
-assign o_valid = fir_done;
-assign debug = {I_out_fir, Q_out_fir, I_out_fir, Q_out_fir};
+logic disc_done;
+
+cordic_vector u_discriminator (
+    .clk   (clk),
+    .rstb  (rstb),
+    .strb  (fir_done),
+    .I_in  (I_out_fir),
+    .Q_in  (Q_out_fir),
+    .phase (mpx_angle),
+    .valid (disc_done)
+);
+
+always_ff @(posedge clk) begin
+    if(fir_done) mpx_angle_last <= mpx_angle;
+    if(disc_done) mpx_data <= (mpx_angle - mpx_angle_last);
+end
+
+logic signed [15:0] mpx_data_desc;
+logic               mpx_valid;
+
+mpx_decimator u_mpx_dec (
+    .clk      (clk),
+    .rstb     (rstb),
+    .data_in  (mpx_data),
+    .valid    (disc_done),
+    .data_out (mpx_data_desc),
+    .strb     (mpx_valid)
+);
+
+
+assign o_valid = mpx_valid;
+assign debug   = {mpx_data_desc, 16'b0, 16'b0, 16'b0};
 endmodule

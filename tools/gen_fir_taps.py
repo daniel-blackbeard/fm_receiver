@@ -132,9 +132,30 @@ if __name__ == "__main__":
           f"{20*np.log10(np.max(np.abs(H[pb_mask]))/(np.min(np.abs(H[pb_mask]))+1e-12)+1e-12):.3f} dB, "
           f"worst stopband gain: {20*np.log10(np.max(np.abs(H[stop_mask]))+1e-12):.2f} dB")
 
-    quantized, scale = quantize_taps(taps, COEFF_WIDTH)
+    # Explicit power-of-2 scale, NOT auto-scaled to the largest tap
+    # (2026-09-15 fix): quantize_taps()'s default auto-scale maximizes
+    # coefficient resolution but lands on an arbitrary non-power-of-2
+    # scale (was 99911.39 here) -- the RTL can only apply integer
+    # bit-shifts (PROD_SHIFT+OUT_SHIFT), so no achievable shift exactly
+    # recovers this filter's designed unity DC/passband gain
+    # (`comp = comp/comp[0]` above). The mismatch was real and measured:
+    # OUT_SHIFT=7 gave ~3.05x actual gain (99911/2^15) -- a 16-bit output
+    # overflow bug; the OUT_SHIFT=9 "fix" for that gave ~0.76x
+    # (99911/2^17) -- safely inside 16 bits, but silently ~24% quieter
+    # than intended, exactly matching the user's real-hardware
+    # observation of low FIR amplitude.
+    #
+    # 2^16=65536 is the largest power-of-2 scale that still fits every
+    # tap in COEFF_WIDTH=16 bits here (verified: max |tap|=0.328,
+    # 0.328*65536=21493, comfortably under +-32767 -- 2^17 does NOT fit,
+    # 0.328*131072=42986 clips). Paired with the RTL's PROD_SHIFT=8, an
+    # OUT_SHIFT=8 (updated in src/fir_time_multiplexed.sv) recovers the
+    # designed gain EXACTLY (up to quantization rounding), not
+    # approximately -- 8+8=16=log2(65536).
+    QUANT_SCALE = 2 ** 16
+    quantized, scale = quantize_taps(taps, COEFF_WIDTH, scale=QUANT_SCALE)
     print(f"quantization scale factor: {scale:.2f}  "
-          f"(i.e. taps are Q-format with {np.log2(scale):.2f} fractional bits)")
+          f"(explicit 2^{int(np.log2(scale))}, not auto-scaled -- see comment above)")
 
     verify_quantized_response(quantized, scale, fs_dec, PASSBAND_EDGE,
                                STOPBAND_EDGE, label=f"quantized {COEFF_WIDTH}-bit")

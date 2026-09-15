@@ -18,35 +18,15 @@ module fir_time_multiplexed #(
   output logic                     done         // one-cycle pulse once BOTH data_out_i/data_out_q are valid
 );
 
-  // ------------------------------------------------------------
-  // Fixed sizing. ACC_WIDTH is derived, not guessed (same reasoning as
-  // cic_dec.sv's bit growth): a WIDTHxWIDTH signed product needs exactly
-  // 2*WIDTH bits; after the fixed PROD_SHIFT-bit right-shift applied to
-  // each product before accumulation, each needs 2*WIDTH-PROD_SHIFT
-  // bits; summing NUM_TAPS of those (worst case: all the same sign, all
-  // at max magnitude) needs ceil(log2(NUM_TAPS)) bits more on top of
-  // that.
-  // ------------------------------------------------------------
   localparam int WIDTH         = 16;  // project-standard datapath width (data and taps both)
   localparam int PARALLELISM   = 8;   // fixed: 8 DSP48-friendly multiplies per cycle, shared between I and Q
   localparam int PROD_SHIFT    = 8;   // fixed-point right-shift applied to each product before accumulation
   localparam int PROD_WIDTH    = 2*WIDTH - PROD_SHIFT;            // 24 @ WIDTH=16
   localparam int ACC_WIDTH     = PROD_WIDTH + $clog2(NUM_TAPS);   // overflow-safe accumulator width
-  // Final output shift, independent of ACC_WIDTH on purpose -- ACC_WIDTH
-  // is sized purely for overflow safety, this is a separate fixed-point
-  // scaling decision (matches bits [22:7] of the original 24-bit accum,
-  // a fixed 7-bit final shift regardless of register width -- total 8+7
-  // =15 bits from raw product to output). See the fixed-point
-  // reconciliation with gen_fir_taps.py as a separate, not-yet-tackled
-  // item.
-  localparam int OUT_SHIFT     = 7;
+
+  localparam int OUT_SHIFT     = 8;
   localparam int NUM_MAC_STEPS = NUM_TAPS / PARALLELISM;
 
-  // Total cycles for one channel's MAC pass: NUM_MAC_STEPS cycles to
-  // issue all the tap-group multiplies, plus 2 more to let the
-  // multiply->partial_sum->accum pipeline drain before accum is read --
-  // see the header comment on why this is needed (a real bug in the
-  // module as inherited, not introduced by this rewrite).
   localparam int TOTAL_STEPS = NUM_MAC_STEPS + 2;
 
   // ------------------------------------------------------------
@@ -72,14 +52,7 @@ module fir_time_multiplexed #(
   logic [$clog2(NUM_TAPS)-1:0]    tap_idx;   // current tap group base index (0, PARALLELISM, 2*PARALLELISM, ...)
   logic [$clog2(TOTAL_STEPS)-1:0] mac_step;  // cycle counter within the current channel's MAC pass
 
-  // fetch: this cycle issues a new real tap-group multiply (only during
-  // the first NUM_MAC_STEPS of each channel's TOTAL_STEPS-cycle pass,
-  // i.e. false during the 2 drain cycles). fetch_d1/fetch_d2: pipelined
-  // copies tracking whether mult[] (1 cycle later) and partial_sum (2
-  // cycles later) hold real data -- accum only accumulates when
-  // fetch_d2 is true, which is what makes the drain correct: every real
-  // tap group gets exactly one accum addition, no more, no less,
-  // wherever in the TOTAL_STEPS window it lands.
+
   logic fetch, fetch_d1, fetch_d2;
 
   typedef enum logic [1:0] {IDLE, MAC_I, MAC_Q, DONE} state_t;
@@ -199,15 +172,17 @@ module fir_time_multiplexed #(
         end
 
         MAC_I, MAC_Q: begin
-          for (int p = 0; p < PARALLELISM; p++) begin
-            (* use_dsp = "yes" *)
-            mult[p] <= sample_s[p] * tap_s[p];
+          if (fetch) begin
+            for (int p = 0; p < PARALLELISM; p++) begin
+              (* use_dsp = "yes" *)
+              mult[p] <= sample_s[p] * tap_s[p];
+            end
           end
 
-          partial_sum <= (mult[0][2*WIDTH-1 -: PROD_WIDTH] + mult[1][2*WIDTH-1 -: PROD_WIDTH])
-                       + (mult[2][2*WIDTH-1 -: PROD_WIDTH] + mult[3][2*WIDTH-1 -: PROD_WIDTH])
-                       + (mult[4][2*WIDTH-1 -: PROD_WIDTH] + mult[5][2*WIDTH-1 -: PROD_WIDTH])
-                       + (mult[6][2*WIDTH-1 -: PROD_WIDTH] + mult[7][2*WIDTH-1 -: PROD_WIDTH]);
+          partial_sum <= ($signed(mult[0][2*WIDTH-1 -: PROD_WIDTH]) + $signed(mult[1][2*WIDTH-1 -: PROD_WIDTH]))
+                       + ($signed(mult[2][2*WIDTH-1 -: PROD_WIDTH]) + $signed(mult[3][2*WIDTH-1 -: PROD_WIDTH]))
+                       + ($signed(mult[4][2*WIDTH-1 -: PROD_WIDTH]) + $signed(mult[5][2*WIDTH-1 -: PROD_WIDTH]))
+                       + ($signed(mult[6][2*WIDTH-1 -: PROD_WIDTH]) + $signed(mult[7][2*WIDTH-1 -: PROD_WIDTH]));
 
           if (fetch_d2) begin
             if (state == MAC_I) accum_i <= accum_i + partial_sum;
