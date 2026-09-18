@@ -106,8 +106,10 @@ class SampleReceiver:
 
     def set_audio_queue(self, q):
         """q: a queue.Queue (or None to disable) that will receive each
-        packet's raw ch0_i samples (unsigned, one small int array per
-        packet) as they arrive. Safe to call at any time, whether or not
+        packet's raw stereo audio samples (unsigned, shape (N,2)) as they
+        arrive. Currently both channels carry mono (ch0_i) -- ster
+        (ch0_q) is muted while the PLL lock issue is being diagnosed, see
+        _run()'s stereo= line. Safe to call at any time, whether or not
         the receiver thread is currently running."""
         with self.lock:
             self.audio_queue = q
@@ -142,15 +144,24 @@ class SampleReceiver:
             samples = struct.unpack(f"<{SAMPLES_PER_PACKET * 4}H", data)
             with self.lock:
                 ch0_i = samples[3::4]
+                ch0_q = samples[2::4]
                 self.buffers["ch1_q"].extend(samples[0::4])
                 self.buffers["ch1_i"].extend(samples[1::4])
-                self.buffers["ch0_q"].extend(samples[2::4])
+                self.buffers["ch0_q"].extend(ch0_q)
                 self.buffers["ch0_i"].extend(ch0_i)
                 self.packets_received += 1
                 self.bytes_received += len(data)
                 if self.audio_queue is not None:
                     try:
-                        self.audio_queue.put_nowait(np.asarray(ch0_i, dtype=np.int64))
+                        # Ster (ch0_q) muted 2026-09-18: PLL isn't locking
+                        # (frequency steadily drifting), which puts a slow
+                        # beat tone into ster since it's downconverted
+                        # against the drifting VCO -- mono (ch0_i) doesn't
+                        # go through that mixer at all, so it's unaffected.
+                        # Both channels play mono until the PLL lock issue
+                        # is fixed; revert to [ch0_q, ch0_i] afterward.
+                        stereo = np.stack([ch0_i, ch0_i], axis=-1).astype(np.int64)
+                        self.audio_queue.put_nowait(stereo)
                     except queue.Full:
                         # Audio consumer fell behind -- drop this chunk
                         # rather than block the receiver thread (packet

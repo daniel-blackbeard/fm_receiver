@@ -56,7 +56,6 @@ import numpy as np
 import serial
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from scipy import signal as scipy_signal
 
 # sounddevice's ctypes.util.find_library() lookup doesn't honor
 # os.add_dll_directory() on Windows -- it needs the DLL's directory on
@@ -87,33 +86,78 @@ except Exception as _exc:  # noqa: BLE001 -- genuinely any failure here should j
 # sample_stream_view.py can still be run standalone alongside this tab, or
 # instead of it, freely.
 from sample_stream_view import (
-    SampleReceiver, CHANNEL_NAMES, SAMPLE_PORT, SAMPLE_RATE_HZ, DEFAULT_FFT_SIZE, cast_signed,
+    SampleReceiver, CHANNEL_NAMES, SAMPLE_PORT, DEFAULT_FFT_SIZE, cast_signed,
 )
 
-# --- Mono (L+R) audio demodulation (2026-09-15) ----------------------------
+# Display-only labels for CHANNEL_NAMES -- CHANNEL_NAMES itself stays as-is
+# (it's also the dict key into SampleReceiver's buffers), this only renames
+# what's shown in plot titles.
 #
-# ch0_i currently carries mpx_data_desc, dsp.sv's MPX composite signal
-# already decimated to 240kHz by mpx_decimator.sv (see src/dsp.sv). This
-# low-pass-filters + decimates that further, in software, to recover
-# mono audio -- deliberately NOT an RTL change: every RTL reload risks
-# the DAP wedge (see project memory, jtag_dap_wedge_after_live_reprogram.md),
-# and this needs no new hardware, just reading the same debug bus already
-# being streamed.
+# 2026-09-18: temporarily swapped from R/L to pre-matrix-combine mono/ster
+# (dsp.sv's debug now sends mono=L+R, ster=L-R instead of R/L) -- a bad
+# PLL lock/downconversion shows up in ster far more clearly than once
+# diluted into both L and R. Revert to Right/Left once this diagnosis is
+# done, see mpx_demod.sv/dsp.sv for the actual signal swap.
+CHANNEL_DISPLAY_NAMES = {
+    "ch0_i": "Mono (L+R)",
+    "ch0_q": "Ster (L-R)",
+    "ch1_i": "RDS (raw)",
+    "ch1_q": "VCO1 (sin)",  # was "Spare", then RDS downconvert experiment
+                              # (removed 2026-09-18) -- now dsp.sv's raw
+                              # pll_vco1_sin, a direct PLL sanity check.
+}
+
+# Which sample-stream channel carries the raw pll_vco1_sin tap -- the FFT
+# tab annotates this one panel with the pilot tone's measured frequency
+# and purity (2026-09-18), since that's the one channel that's supposed to
+# be a single clean sinusoid and nothing else.
+TONE_MONITOR_CHANNEL = "ch1_q"
+
+
+def tone_peak_and_purity(freqs_khz, spectrum):
+    """Peak frequency (kHz, parabolic-interpolated for sub-bin accuracy)
+    and purity (dB) of the dominant tone in `spectrum` (complex rfft
+    output, DC-first). Purity is 10*log10(tone power / everything-else
+    power): tone power is the peak bin plus its immediate neighbors (to
+    capture the Hanning window's own main-lobe spread, not just the
+    single tallest bin), everything-else is the rest of the spectrum
+    excluding DC. High dB = a clean single tone; low dB = a noisy/
+    unlocked one."""
+    power = np.abs(spectrum) ** 2
+    power = power.copy()
+    power[0] = 0.0  # exclude DC from both the peak search and the totals
+    peak_idx = int(np.argmax(power))
+
+    if 0 < peak_idx < len(power) - 1:
+        # Standard 3-point parabolic interpolation on log-magnitude.
+        y0 = np.log(power[peak_idx - 1] + 1e-30)
+        y1 = np.log(power[peak_idx] + 1e-30)
+        y2 = np.log(power[peak_idx + 1] + 1e-30)
+        denom = y0 - 2 * y1 + y2
+        delta = 0.5 * (y0 - y2) / denom if denom != 0 else 0.0
+        delta = float(np.clip(delta, -0.5, 0.5))
+        bin_width = freqs_khz[1] - freqs_khz[0]
+        peak_freq_khz = freqs_khz[peak_idx] + delta * bin_width
+    else:
+        peak_freq_khz = float(freqs_khz[peak_idx])
+
+    lo = max(0, peak_idx - 1)
+    hi = min(len(power), peak_idx + 2)
+    tone_power = float(np.sum(power[lo:hi]))
+    total_power = float(np.sum(power))
+    noise_power = max(total_power - tone_power, 1e-30)
+    purity_db = 10.0 * np.log10(tone_power / noise_power)
+    return peak_freq_khz, purity_db
+
+# --- Stereo (L/R) audio playback (2026-09-18) -------------------------------
 #
-# Same filter spec as src/tools/gen_mono_lpf_taps.py's RTL design
-# (15kHz passband -- standard FM mono bandwidth, 18kHz stopband -- clears
-# the 19kHz pilot with margin) but computed directly in float here, no
-# fixed-point quantization concerns since this never touches hardware.
-AUDIO_IN_RATE_HZ = 240_000    # mpx_data_desc's rate (post mpx_decimator.sv)
-AUDIO_DECIM = 5                # -> 48kHz, a standard audio output rate
-AUDIO_OUT_RATE_HZ = AUDIO_IN_RATE_HZ // AUDIO_DECIM
-AUDIO_PASSBAND_HZ = 15_000
-AUDIO_STOPBAND_HZ = 18_000
-AUDIO_LPF_TAPS = 96
-AUDIO_LPF_B = scipy_signal.remez(
-    AUDIO_LPF_TAPS, [0, AUDIO_PASSBAND_HZ, AUDIO_STOPBAND_HZ, AUDIO_IN_RATE_HZ / 2],
-    [1, 0], fs=AUDIO_IN_RATE_HZ,
-)
+# ch0_i/ch0_q now carry dsp.sv's real stereo audio directly: mpx_fir.sv +
+# mpx_demod.sv do the lowpass filtering, decimation to 48kHz, and L/R
+# matrix combine in hardware (ch0_i=audio_r, ch0_q=audio_l, dsp.sv's
+# debug-bus packing), gated by mpx_demod_valid -- no software filtering
+# or decimation needed here anymore, just playback of what's already
+# arriving at the right rate.
+AUDIO_OUT_RATE_HZ = 48_000
 
 # --- Protocol constants (mirrors sw/eth0.h / sw/main.c exactly) -----------
 
@@ -204,6 +248,19 @@ AXI_REGMAP_FIELDS = [
         ("TXNRX (bit1)",        0x1, 1),
         ("RESETB released (bit2)", 0x1, 2),
         ("R1_MODE (bit3)",      0x1, 3),
+    ]),
+    (0x0C, "Phase Step (NCO)", [
+        ("Phase step (bits[31:0])", 0xFFFFFFFF, 0),
+    ]),
+    # dsp.sv's cfg0 -- keep this in sync with dsp.sv's own top-of-file
+    # "cfg0[31:0] documentation" comment, the source of truth for what
+    # each bit does.
+    (0x10, "DSP Config (cfg0)", [
+        ("AFC loop enable (bit0)",        0x1, 0),
+        ("Discriminator reset (bit28)",   0x1, 28),
+        ("Decimator reset (bit29)",       0x1, 29),
+        ("PLL reset (bit30)",             0x1, 30),
+        ("Demodulator reset (bit31)",     0x1, 31),
     ]),
 ]
 
@@ -319,6 +376,14 @@ class ConsoleApp:
         self._rate_last_t = 0.0
         self._rate_last_pkts = 0
         self._rate_last_bytes = 0
+        # Cumulative-since-listening-started counterparts (2026-09-18):
+        # the per-tick instantaneous rate above is too noisy (~200ms of
+        # packet/OS-scheduling jitter) to tell a real sample-rate
+        # mismatch (e.g. true rate vs. the 48kHz the audio path assumes)
+        # from normal jitter -- averaging over a long, growing window
+        # cancels that jitter out. See _sample_update_body().
+        self._rate_start_t = 0.0
+        self._rate_start_bytes = 0
 
         self._build_transport_bar(root)
 
@@ -660,14 +725,14 @@ class ConsoleApp:
         self._sample_toggle_btns.append(sample_toggle_btn)
 
         # Editable sample rate driving the FFT frequency axis, defaulting
-        # to the current hardware-measured decimated rate (SAMPLE_RATE_HZ,
-        # from sample_stream_view.py -- see its own comment for how that
-        # figure was derived). Not read from the board; purely a display
-        # setting, so it's safe to change freely if the decimation ratio
-        # or clk_dsp ever changes.
-        self.sample_rate_hz = SAMPLE_RATE_HZ
+        # to 48kHz (2026-09-18) -- the debug bus now carries real stereo
+        # audio at AUDIO_OUT_RATE_HZ, not the old raw decimated sample
+        # rate (SAMPLE_RATE_HZ, from sample_stream_view.py), so that's
+        # the more useful default now. Not read from the board; purely a
+        # display setting, so it's safe to change freely.
+        self.sample_rate_hz = AUDIO_OUT_RATE_HZ
         ttk.Label(ctrl, text="Sample rate (Hz):").pack(side="left", padx=(16, 4))
-        self.sample_rate_var = tk.StringVar(value=f"{SAMPLE_RATE_HZ:.0f}")
+        self.sample_rate_var = tk.StringVar(value=f"{AUDIO_OUT_RATE_HZ:.0f}")
         rate_entry = ttk.Entry(ctrl, textvariable=self.sample_rate_var, width=12)
         rate_entry.pack(side="left")
         rate_entry.bind("<Return>", self._on_sample_rate_change)
@@ -694,7 +759,7 @@ class ConsoleApp:
         # noise unprompted. See _on_audio_toggle() for the pipeline.
         self.audio_enabled_var = tk.BooleanVar(value=False)
         audio_check = ttk.Checkbutton(
-            ctrl, text=f"Audio (mono, {AUDIO_OUT_RATE_HZ//1000}kHz)",
+            ctrl, text=f"Audio (stereo, {AUDIO_OUT_RATE_HZ//1000}kHz)",
             variable=self.audio_enabled_var, command=self._on_audio_toggle,
         )
         audio_check.pack(side="left", padx=(16, 4))
@@ -707,17 +772,24 @@ class ConsoleApp:
 
         fig = Figure(figsize=(9, 6))
         axes = fig.subplots(2, 2)
-        self.sample_freqs_mhz = np.fft.rfftfreq(DEFAULT_FFT_SIZE, d=1.0 / SAMPLE_RATE_HZ) / 1e6
+        self.sample_freqs_khz = np.fft.rfftfreq(DEFAULT_FFT_SIZE, d=1.0 / AUDIO_OUT_RATE_HZ) / 1e3
         self.sample_window = np.hanning(DEFAULT_FFT_SIZE)
         self.sample_axes = axes
         self.sample_lines = {}
+        self.sample_tone_text = None
         for ax, name in zip(axes.flat, CHANNEL_NAMES):
-            (line,) = ax.plot(self.sample_freqs_mhz, np.zeros_like(self.sample_freqs_mhz))
-            ax.set_title(name)
-            ax.set_xlabel("Freq (MHz)")
+            (line,) = ax.plot(self.sample_freqs_khz, np.zeros_like(self.sample_freqs_khz))
+            ax.set_title(CHANNEL_DISPLAY_NAMES[name])
+            ax.set_xlabel("Freq (kHz)")
             ax.set_ylabel("Magnitude (dB)")
             ax.set_ylim(-20, 100)
             self.sample_lines[name] = line
+            if name == TONE_MONITOR_CHANNEL:
+                self.sample_tone_text = ax.text(
+                    0.98, 0.95, "", transform=ax.transAxes, ha="right", va="top",
+                    fontsize=9, family="monospace",
+                    bbox=dict(boxstyle="round", facecolor="white", alpha=0.75),
+                )
         fig.tight_layout()
 
         self.sample_canvas = FigureCanvasTkAgg(fig, master=f)
@@ -767,7 +839,7 @@ class ConsoleApp:
         axes = fig.subplots(2, 2)
         self.eye_axes = axes
         for ax, name in zip(axes.flat, CHANNEL_NAMES):
-            ax.set_title(name)
+            ax.set_title(CHANNEL_DISPLAY_NAMES[name])
             ax.set_xlabel("Sample index within eye")
             ax.set_ylabel("Amplitude")
         fig.tight_layout()
@@ -810,7 +882,7 @@ class ConsoleApp:
         persistence = self.eye_persistence
         for ax, name in zip(self.eye_axes.flat, CHANNEL_NAMES):
             ax.cla()
-            ax.set_title(name)
+            ax.set_title(CHANNEL_DISPLAY_NAMES[name])
             ax.set_xlabel("Sample index within eye")
             ax.set_ylabel("Amplitude")
             buf = data[name]
@@ -833,11 +905,11 @@ class ConsoleApp:
             self.sample_rate_var.set(f"{self.sample_rate_hz:.0f}")  # revert to last-good
             return
         self.sample_rate_hz = rate_hz
-        self.sample_freqs_mhz = np.fft.rfftfreq(DEFAULT_FFT_SIZE, d=1.0 / rate_hz) / 1e6
+        self.sample_freqs_khz = np.fft.rfftfreq(DEFAULT_FFT_SIZE, d=1.0 / rate_hz) / 1e3
         for line in self.sample_lines.values():
-            line.set_xdata(self.sample_freqs_mhz)
+            line.set_xdata(self.sample_freqs_khz)
         for ax in self.sample_axes.flat:
-            ax.set_xlim(self.sample_freqs_mhz[0], self.sample_freqs_mhz[-1])
+            ax.set_xlim(self.sample_freqs_khz[0], self.sample_freqs_khz[-1])
         self.sample_canvas.draw_idle()
 
     def _toggle_sample_stream(self):
@@ -854,6 +926,8 @@ class ConsoleApp:
             self._rate_last_t = time.monotonic()
             self._rate_last_pkts = 0
             self._rate_last_bytes = 0
+            self._rate_start_t = self._rate_last_t
+            self._rate_start_bytes = 0
             for btn in self._sample_toggle_btns:
                 btn.config(text="Stop listening")
             self._sample_update()
@@ -880,11 +954,8 @@ class ConsoleApp:
 
     def _on_audio_toggle(self):
         """Checkbox callback. Off by default -- see _build_sample_tab().
-        Starting audio doesn't touch the FPGA/firmware at all, just taps
-        the already-streaming ch0_i (mpx_data_desc) samples in software
-        (see the AUDIO_* constants' header comment for why: an RTL
-        change here would mean another live reprogram, risking the DAP
-        wedge, for something that doesn't need hardware at all)."""
+        Just taps the already-streaming ch0_i/ch0_q (real stereo audio,
+        see the AUDIO_* constants' header comment) for playback."""
         if self.audio_enabled_var.get():
             if self.sample_recv is None:
                 self.audio_status_var.set("Start listening first")
@@ -910,38 +981,26 @@ class ConsoleApp:
 
     def _audio_worker(self):
         """Runs on its own thread (never the Tk main thread) for the
-        whole time audio is enabled: drains audio_queue (ch0_i chunks,
-        32 raw unsigned samples per UDP packet), low-pass filters +
-        decimates to AUDIO_OUT_RATE_HZ, and streams it out via
-        sounddevice. Filter state (zi) and decimation phase are both
-        carried across chunks -- a 32-sample chunk isn't a multiple of
-        AUDIO_DECIM=5, so without phase tracking the decimation point
-        would silently reset every chunk boundary instead of continuing
-        smoothly (a real, audible artifact, not just a cosmetic one)."""
-        zi = np.zeros(len(AUDIO_LPF_B) - 1)
+        whole time audio is enabled: drains audio_queue (stereo [L, R]
+        chunks, raw unsigned samples per UDP packet, already at
+        AUDIO_OUT_RATE_HZ -- see the AUDIO_* header comment) and streams
+        it out via sounddevice. No filtering or decimation needed here
+        anymore, that's all done in hardware now."""
         peak_est = 1.0
-        n_total = 0  # running count of filtered (pre-decimation) samples, for decimation phase
         stream = None
         try:
-            stream = sd.OutputStream(samplerate=AUDIO_OUT_RATE_HZ, channels=1, dtype="float32")
+            stream = sd.OutputStream(samplerate=AUDIO_OUT_RATE_HZ, channels=2, dtype="float32")
             stream.start()
             while not self._audio_stop.is_set():
                 try:
                     chunk = self.audio_queue.get(timeout=0.2)
                 except queue.Empty:
                     continue
-                x = cast_signed(chunk).astype(np.float64)
-                y, zi = scipy_signal.lfilter(AUDIO_LPF_B, [1.0], x, zi=zi)
-
-                i_start = (-n_total) % AUDIO_DECIM
-                y_dec = y[i_start::AUDIO_DECIM]
-                n_total += len(y)
-                if y_dec.size == 0:
-                    continue
+                y = cast_signed(chunk).astype(np.float64)  # shape (N, 2), [L, R]
 
                 # Slowly-adapting peak normalization + hard safety clip:
-                # mpx_data's real-world amplitude was never calibrated to
-                # any fixed reference (see project memory,
+                # audio_l/audio_r's real-world amplitude was never
+                # calibrated to any fixed reference (see project memory,
                 # cordic_vector_hardware_stall.md's gain-chain
                 # investigation), so this is "don't be silent, don't
                 # clip harshly" -- not a precise loudness target. Decays
@@ -949,11 +1008,11 @@ class ConsoleApp:
                 # every loud transient, but jumps up instantly to a new,
                 # louder peak so a sudden loud passage doesn't clip
                 # before the estimate catches up.
-                chunk_peak = float(np.max(np.abs(y_dec)))
+                chunk_peak = float(np.max(np.abs(y))) if y.size else 0.0
                 peak_est = max(chunk_peak, peak_est * 0.999)
                 scale = 0.6 / peak_est if peak_est > 1e-6 else 0.0
-                out = np.clip(y_dec * scale, -1.0, 1.0).astype(np.float32)
-                stream.write(out.reshape(-1, 1))
+                out = np.clip(y * scale, -1.0, 1.0).astype(np.float32)
+                stream.write(out)
         except Exception as exc:  # noqa: BLE001 -- report and exit cleanly, don't take the console down
             self.audio_status_var.set(f"Audio error: {exc}")
         finally:
@@ -967,6 +1026,23 @@ class ConsoleApp:
     def _sample_update(self):
         if self.sample_recv is None:
             return
+        # Whole body wrapped try/finally (2026-09-18): this reschedules
+        # itself at the end, so any uncaught exception here previously
+        # killed the entire redraw loop silently (FFT, eye diagram, rate
+        # display, everything) -- not just whatever pane actually broke.
+        # finally guarantees the next tick still fires regardless; the
+        # except surfaces the error in the status bar instead of losing
+        # it, so a real bug is still visible, just not fatal to the tool.
+        try:
+            self._sample_update_body()
+        except Exception as exc:  # noqa: BLE001 -- must never kill the redraw loop
+            self.sample_status_var.set(f"Redraw error (see console): {exc}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.sample_after_id = self.root.after(200, self._sample_update)
+
+    def _sample_update_body(self):
         # FFT re-enabled 2026-09-13: dsp_clk fix + rx_clk margin confirmed,
         # and rate_counter.py proved the earlier rate cap/jitter was this
         # tool's own GIL/rendering contention, not FPGA/firmware throughput
@@ -983,8 +1059,15 @@ class ConsoleApp:
             buf = data[name]
             if len(buf) < DEFAULT_FFT_SIZE:
                 continue
-            spectrum = np.fft.rfft(buf[-DEFAULT_FFT_SIZE:] * self.sample_window)
+            windowed = buf[-DEFAULT_FFT_SIZE:].astype(np.float64)
+            windowed = windowed * self.sample_window
+            spectrum = np.fft.rfft(windowed)
             line.set_ydata(20 * np.log10(np.abs(spectrum) + 1e-9))
+            if name == TONE_MONITOR_CHANNEL and self.sample_tone_text is not None:
+                peak_freq_khz, purity_db = tone_peak_and_purity(self.sample_freqs_khz, spectrum)
+                self.sample_tone_text.set_text(
+                    f"peak: {peak_freq_khz:.3f} kHz\npurity: {purity_db:.1f} dB"
+                )
         # Self-adjusting Y limits: a fixed range clips PRBS's much higher
         # noise floor compared to a clean tone. relim() recomputes data
         # limits from each line's just-updated ydata; scalex=False leaves
@@ -1000,7 +1083,9 @@ class ConsoleApp:
 
         # Instantaneous rate since the last tick (~200ms), not a cumulative
         # average -- matches what "is the stream actually still flowing"
-        # questions actually want to know.
+        # questions actually want to know. Too noisy on its own to read
+        # off a true underlying sample rate, though -- see the
+        # since-start average below for that.
         now = time.monotonic()
         dt = now - self._rate_last_t
         pkt_rate = (self.sample_recv.packets_received - self._rate_last_pkts) / dt if dt > 0 else 0.0
@@ -1009,21 +1094,32 @@ class ConsoleApp:
         self._rate_last_pkts = self.sample_recv.packets_received
         self._rate_last_bytes = self.sample_recv.bytes_received
 
+        # Cumulative average since listening started: same bytes_received
+        # counter, just divided by the whole elapsed time instead of one
+        # tick -- the per-tick jitter above averages out, leaving a
+        # stable read on the real sample rate (8 bytes/sample: 4 channels
+        # x 16 bits, see axi_dsp.sv's debug-bus packing). Settles over
+        # the first several seconds; trust it more the longer it's run.
+        avg_dt = now - self._rate_start_t
+        avg_byte_rate_mb = self.sample_recv.bytes_received / avg_dt / 1e6 if avg_dt > 0 else 0.0
+        avg_sample_rate_hz = self.sample_recv.bytes_received / 8.0 / avg_dt if avg_dt > 0 else 0.0
+
         self.sample_status_var.set(
             f"Listening on :{SAMPLE_PORT} -- {self.sample_recv.packets_received} pkts "
             f"({pkt_rate:.0f}/s), {self.sample_recv.bytes_received / 1e6:.2f} MB "
-            f"({byte_rate_mb:.2f} MB/s), {self.sample_recv.packets_dropped} dropped"
+            f"({byte_rate_mb:.2f} MB/s), {self.sample_recv.packets_dropped} dropped | "
+            f"avg over {avg_dt:.0f}s: {avg_byte_rate_mb:.3f} MB/s = {avg_sample_rate_hz:.1f} Hz/ch"
         )
         self.sample_canvas.draw_idle()
 
-        # Disabled again 2026-09-15: heavy CPU/rate cost while tuning a
-        # real FM station and checking the FFT for MPX structure (pilot/
-        # stereo lobes) -- don't need the eye diagram for that, and it
-        # was draining the CPU. Re-enable if a raw time-domain debug read
-        # is needed again (see prior enable/disable history in this file).
+        # Disabled again 2026-09-18: testing whether this redraw's matplotlib/
+        # GIL load is the real cause of the audio beat -- RTL (PLL windup,
+        # reset polarity) and sample-rate mismatch are both ruled out at
+        # this point, and the only variable that's ever correlated with the
+        # beat coming and going is restarting pc_console.py itself, which
+        # points at something in this process, not the signal. See prior
+        # enable/disable history in this file for the toggle pattern.
         # self._eye_update(data)
-
-        self.sample_after_id = self.root.after(200, self._sample_update)
 
     def _on_close(self):
         self._stop_sample_stream()

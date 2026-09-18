@@ -274,6 +274,15 @@ wire [31:0] phase_step_ps = regmap[127:96];
 logic [31:0] phase_step_dsp;
 always_ff @(posedge dsp_clk) phase_step_dsp <= phase_step_ps;
 
+// RM 0x10: reserved, generic dsp.sv config word (2026-09-18). Same
+// accepted single-plain-register CDC shortcut as phase_step_dsp above,
+// same reasoning: not wired to any real enable/disable logic inside
+// dsp.sv yet, so there's nothing here a torn/glitched crossing could
+// corrupt beyond one dsp_clk cycle of a stale config value.
+wire [31:0] dsp_cfg0_ps = regmap[159:128];
+logic [31:0] dsp_cfg0_dsp;
+always_ff @(posedge dsp_clk) dsp_cfg0_dsp <= dsp_cfg0_ps;
+
 always_ff @( posedge fclk0 ) begin
     counter <= counter + 32'b1;
 end
@@ -793,11 +802,14 @@ dsp u_dsp (
     .rx_data_i2 (adc_data_i2),
     .rx_data_q2 (adc_data_q2),
     .phase_step (phase_step_dsp),
+    .cfg0       (dsp_cfg0_dsp),
     .o_data1    (),
     .o_data2    (),
     .o_valid    (dsp_o_valid),
     .debug      (dsp_debug)
 );
+
+// mpx_demod is instantiated inside dsp.sv itself, see dsp.sv.
 
 // Glue logic: decimation stage x8 (declarations moved up to axi_dsp's
 // own declaration block above -- same reasoning as dsp_clk's forward
@@ -833,20 +845,7 @@ end
 
 assign dec_done = dec_counter == 3'b0;
 
-// TEMPORARY diagnostic (2026-09-13): gpio_3p3_2 reassigned from
-// adc_status to a free-running dsp_clk-domain counter bit, giving a
-// direct, assumption-free physical readout of dsp_clk's real frequency
-// -- sidesteps every layer of software/AXI/UDP that the other rate
-// experiments went through. Bit 22 -> full blink period 2^23 cycles:
-// ~3.55Hz (fast flicker) if dsp_clk really is ~29.8MHz, ~0.89Hz (one
-// clear blink per ~1.1s) if it's actually ~7.5MHz, matching the
-// decimated-sample-rate-derived hypothesis. Revert to adc_status once
-// this is settled.
-logic [31:0] dsp_clk_counter;
-always_ff @(posedge dsp_clk) begin
-    dsp_clk_counter <= dsp_clk_counter + 32'b1;
-end
-assign gpio_3p3_2 = dsp_clk_counter[22];
+assign gpio_3p3_2 = adc_status;
 
 logic [31:0] dsp_counter;
 always_ff @( posedge dsp_clk ) begin

@@ -16,6 +16,8 @@ webtalk*.log
 usage_statistics_webtalk.html
 .Rerun_*
 *.zip
+xsim.dir/
+dfx_runtime.txt
 
 # JVM crash dumps Vivado sometimes leaves behind
 hs_err_pid*.log
