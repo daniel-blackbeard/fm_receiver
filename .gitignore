@@ -43,7 +43,15 @@ __pycache__/
 # stays local (not needed to replicate the build or reuse the code).
 scripts/
 constraints/
-src/PS/
+# src/PS/ is excluded except design_1.bd -- the actual source of truth
+# for the PS7 config (scripts/ps7.tcl regenerates the .xci/.bda/HDL from
+# this alone; those regenerated files aren't needed for replicability).
+src/PS/*
+!src/PS/bd/
+src/PS/bd/*
+!src/PS/bd/design_1/
+src/PS/bd/design_1/*
+!src/PS/bd/design_1/design_1.bd
 setup_env.bat
 setup_env.ps1
 explanation.md
