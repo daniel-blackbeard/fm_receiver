@@ -49,6 +49,11 @@ setup_env.ps1
 explanation.md
 rds_decoding.md
 bringup_log.md
+CLAUDE.md
+
+# Pictures/plots -- generated analysis output, not source.
+*.jpg
+*.png
 
 # Dead code, not instantiated anywhere -- kept locally in case it's
 # useful again, not part of the tracked RTL.
