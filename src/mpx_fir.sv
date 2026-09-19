@@ -23,8 +23,7 @@ logic signed [15:0] buffer_mono [0:255];
 logic signed [15:0] buffer_ster [0:255];
 logic signed [35:0] mono_accum, ster_accum;
 logic signed [15:0] taps   [0:255];
-// PLACEHOLDER coefficients (15kHz passband / 18kHz stopband, ~240kHz),
-// just to give synthesis something real -- proper filter design TBD.
+
 initial $readmemh("mpx_fir_coeffs.hex", taps);
 
 // Combinational 8-way MAC for the current tap group.
@@ -50,9 +49,6 @@ always_ff @(posedge clk) begin
         ster_accum   <= '0;
     end else begin
         if(strb) begin
-            // ==3'b101 (5), not 4: the transition check below reads
-            // counter the cycle *after* a strobe updates it, so a
-            // threshold of 4 only ever waited for 4 real strobes, not 5.
             counter <= counter == 3'b101 ? 3'b0 : counter + 3'b1;
             for (int i = 0; i < 255; i++) begin
                 buffer_mono[i] <= buffer_mono[i+1];
@@ -62,9 +58,6 @@ always_ff @(posedge clk) begin
             buffer_ster[255] <= i_mpx_ster;
         end
 
-        // Transition checks compare tap_idx/counter directly (not a
-        // registered "done" flag derived from them) -- a derived flag
-        // would lag one cycle behind, re-running the last tap group.
         case (state)
             ACCUM : state <= (counter == 3'b101)          ? MONO : ACCUM;
             MONO  : state <= (tap_idx == 256-PARALLELISM) ? STER : MONO;
@@ -90,12 +83,6 @@ always_ff @(posedge clk) begin
         end
 
         if(state == DONE) begin
-            // counter free-runs on every strb regardless of state, but
-            // normally no strb lands during MONO/STER/DONE (65 cycles,
-            // strobes ~125 apart) -- so without this it's still stuck
-            // at 4 when ACCUM is re-entered, retriggering MONO one
-            // cycle later with zero new samples instead of waiting for
-            // the next 4 real strobes. Reset here, once, on the way out.
             counter      <= '0;
             valid        <= 1'b1;
             o_audio_mono <= mono_accum >>> 20;

@@ -141,16 +141,6 @@ always_ff @(posedge clk) begin
         pilot_dc2 <= '0;
     end else begin
         if(vco1_ready_d1) begin
-            // 32'sd... (signed), not 32'd... -- an unsigned literal here
-            // contaminates the WHOLE expression to unsigned arithmetic
-            // (SV rule: any unsigned operand makes the whole expression
-            // unsigned), so pilot_mix-pilot_dc1 going negative (~half of
-            // real operation) got reinterpreted as a huge unsigned value
-            // and >>> silently became a logical (not arithmetic) shift on
-            // it -- confirmed 2026-09-18 via hand-verified trace mismatch
-            // against a golden Python model (cyc 897->898: correct signed
-            // math gives pilot_dc1=3468787, the bug gives the logged
-            // 20246003, bit-exact match to the unsigned reinterpretation).
             pilot_dc1 <= pilot_dc1 + ((pilot_mix - pilot_dc1 + 32'sd128) >>> 8);
             pilot_dc2 <= pilot_dc2 + ((pilot_dc1 - pilot_dc2 + 32'sd256) >>> 9);
             pilot_dc  <= pilot_dc  + ((pilot_dc2 - pilot_dc  + 32'sd512) >>> 10);

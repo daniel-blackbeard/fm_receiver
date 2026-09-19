@@ -1,34 +1,5 @@
 `timescale 1ns / 1ps
-//
-// mpx_decimator.sv (2026-09-15) -- single-stage (N=1) CIC decimator,
-// decimate-by-5, for narrowing pc_console.py's FFT window on mpx_data
-// (1.2MHz -> 240kHz, Nyquist 600kHz -> 120kHz). Deliberately hardcoded,
-// not parametric/reusable (see cic_dec.sv's parametrization attempt
-// earlier this session, reverted -- that generality wasn't the right
-// fit) and NOT I/Q (mpx_data is a single real signal, not a complex
-// pair).
-//
-// Critical difference from cic_dec.sv: this module's input is NOT fresh
-// every clk cycle -- mpx_data only updates once per disc_done pulse
-// (~once every 25 dsp_clk cycles upstream, via the CIC+FIR+CORDIC
-// chain). The integrator, the comb, and the R=5 decimation counter all
-// run on/count `valid` (wire to disc_done), NOT raw clk cycles -- a
-// naive port of cic_dec.sv's continuous per-cycle counting would
-// silently integrate the same stale sample ~17-25x too many times
-// between real updates.
-//
-// Sizing (same Hogenauer-bound reasoning as cic_dec.sv's 2026-09-15 fix,
-// N=1 here): GROWTH=ceil(log2(R^N))=ceil(log2(5))=3 bits.
-// ACC_WIDTH=IN_WIDTH+GROWTH=16+3=19 bits. OUT_SHIFT=IN_WIDTH-OUT_WIDTH+
-// GROWTH=16-16+3=3 -- tightest shift with no overflow for a sustained
-// full-scale input: 32768*5=163840, >>3=20480 (fits +-32767);
-// >>2=40960 would NOT fit.
-//
-// Timing convention mirrors cic_dec.sv's own proven pattern exactly
-// (comb reads the integrator's pre-this-cycle value, i.e. before this
-// cycle's own addition applies -- a labeling/boundary convention that
-// doesn't affect steady-state gain, only where exactly the transient
-// settles after reset, same as the original).
+
 module mpx_decimator (
     input  logic               clk,
     input  logic               rstb,

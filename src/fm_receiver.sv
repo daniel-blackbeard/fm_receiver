@@ -66,12 +66,6 @@ wire        dsp_o_valid;   // dsp.sv's FIR-done pulse; same forward-declaration 
 wire [63:0] dsp_debug;     // above -- axi_dsp's instantiation (earlier in the file) needs these,
                             // the real dsp module instance is down by ad3961_if_rx
 
-// M_AXI_GP0 — PS7's AXI3 master into the PL. Internal wires, not top-level
-// ports: this bus never leaves the chip. It goes straight into axi_if
-// (below), which turns it into the wen/ren peripheral bus fanned out to
-// axi_registers/axi_spi. Directions below are from design_1_wrapper's
-// perspective (PS7 as AXI master); axi_if, as the slave, has every
-// direction flipped relative to this list.
 wire [31:0] m_axi_gp0_araddr;
 wire [1:0]  m_axi_gp0_arburst;
 wire [3:0]  m_axi_gp0_arcache;
@@ -111,19 +105,6 @@ wire        m_axi_gp0_wready;
 wire [3:0]  m_axi_gp0_wstrb;
 wire        m_axi_gp0_wvalid;
 
-// S_AXI_HP0 -- opposite direction from M_AXI_GP0 above: PS7 is the AXI
-// *slave* here, so the master-role signals (everything except the
-// *ready outputs) are driven INTO design_1_wrapper from whatever PL
-// master eventually exists, not out of it. Placeholder tie-offs live
-// right after the design_1_wrapper/axi_if instantiations below, driving
-// every master-role signal to a safe idle value until a real master
-// (the planned RX-sample-to-DDR streaming engine) replaces them --
-// see ps7_configure.tcl's S_AXI_HP0 section for the PS7-side setup.
-// Widths and directions taken directly from the generated
-// design_1_wrapper.v (64-bit data, 6-bit ID, confirmed after enabling
-// S_AXI_HP0 -- not guessed): ID width is 6 bits here, not 12 like GP0's,
-// and there's no separate ACLK port since it's wired internally in the
-// BD (looped back to the same FCLK_CLK0 fm_receiver runs on).
 wire [31:0] s_axi_hp0_araddr;
 wire [1:0]  s_axi_hp0_arburst;
 wire [3:0]  s_axi_hp0_arcache;
@@ -163,17 +144,6 @@ wire        s_axi_hp0_wready;
 wire [7:0]  s_axi_hp0_wstrb;
 wire        s_axi_hp0_wvalid;
 
-// Peripheral bus: axi_if (below) fans this out identically to every
-// peripheral in parallel -- no interconnect, no address-range table.
-// Each peripheral decodes p_waddr[23:16]/p_raddr[23:16] against its own
-// PERIPH_ID and only reacts on a match; see src/axi_if.sv's port-list
-// comment for the full contract. wen/ren/addr/data/strb are broadcast
-// identically to both peripherals below; each peripheral's own
-// done/no_addr/rdata come back on separate wires and get combined into
-// the final p_* signals feeding axi_if: OR the dones, AND the no_addrs,
-// mux rdata by whichever peripheral's rdone is high -- safe since
-// PERIPH_ID match is mutually exclusive by construction (see
-// src/axi_if.sv's port-list comment).
 wire        p_wen;
 wire [31:0] p_waddr;
 wire [31:0] p_wdata;
@@ -440,13 +410,6 @@ axi_dsp u_axi_dsp (
     .rstb_dsp  (rstb_dsp_sync),
     .rstb_fpga (axi_dsp_rstb_fpga),
 
-    // dsp.sv's FIR-done pulse and packed debug tap (see the dsp
-    // instantiation below the AD9361 RX interface) -- replaces the old
-    // placeholder decimator signals (data_rx0_i/q, data_rx1_i/q,
-    // dec_done are still computed further down, just no longer feed
-    // this). debug = {I_out_fir, Q_out_fir, I_out_fir, Q_out_fir}: ch0
-    // gets the real demod chain output, ch1 mirrors it (RX2/second
-    // channel isn't processed yet).
     .i_valid (dsp_o_valid),
     .ch0_i (dsp_debug[63:48]),
     .ch0_q (dsp_debug[47:32]),
@@ -599,18 +562,6 @@ axi_spi #(
     .spi_ck   (spi_clk)
 );
 
-// DSP-side write port for axi_cdc_status. axi_cdc_status only accepts one
-// 8-bit lane per dsp_clk cycle (dsp_wdata into 1-of-64 lanes selected by
-// dsp_windex), but there are several live status values to keep mirrored
-// (RX data snapshot, valid count, error count, raw pre-decode diagnostic
-// taps, and the 32-bit heartbeat counter split across 4 lanes) --
-// cdc_mirror_* below is a small round-robin sequencer that rewrites each
-// target lane in turn, one per dsp_clk cycle, reusing the single-lane
-// port exactly as designed rather than changing axi_cdc_status.sv's
-// interface. dsp_rstb is tied to 1'b1
-// for now: dsp_clk-domain logic elsewhere in this file (dsp_counter, the
-// adc_r1_mode sync chain) has no reset wired up yet either -- a real
-// dsp-domain reset is a separate, not-yet-decided piece of work.
 wire [511:0] cdc_dsp_reg_out;
 wire         cdc_dsp_wen;
 logic [5:0]  cdc_dsp_windex;
@@ -738,11 +689,6 @@ axi_notifications #(
 logic        adc_r1_mode;
 logic        adc_r1_mode_dsp;
 logic        adc_valid;
-// signed: adc_data_i1 etc. are operands in data_rx0_i's accumulation
-// (below) alongside the signed 16-bit accumulator -- SystemVerilog
-// evaluates a mixed signed/unsigned expression entirely as unsigned if
-// any operand is unsigned, so leaving these unsigned silently defeated
-// data_rx0_i's own signed declaration on every add.
 logic signed [11:0] adc_data_i1;
 logic signed [11:0] adc_data_q1;
 logic signed [11:0] adc_data_i2;
@@ -783,16 +729,6 @@ ad3961_if_rx u_ad3961_if_rx (
     .dbg_rx_frame_s  (dbg_rx_frame_s)
 );
 
-// Digital demod chain (mixer -> cic_dec -> fir_time_multiplexed, see
-// dsp.sv) -- first real hardware sanity-check wiring, 2026-09-13.
-// o_data1/o_data2 intentionally left unconnected: no discriminator
-// built yet, plenty more processing between here and a real audio/data
-// output. o_valid/debug instead feed axi_dsp below (in place of the old
-// placeholder decimator signals), so the FIR's actual output can be
-// observed over the existing, already hardware-verified axi_dsp -> DDR
-// -> GEM -> UDP sample-stream pipeline (pc_console.py's FFT tab) without
-// building new debug infrastructure. dsp_o_valid/dsp_debug forward-
-// declared up near dec_done/data_rx0_i, same reasoning.
 dsp u_dsp (
     .clk        (dsp_clk),
     .rstb       (rstb_dsp_sync),
@@ -809,23 +745,8 @@ dsp u_dsp (
     .debug      (dsp_debug)
 );
 
-// mpx_demod is instantiated inside dsp.sv itself, see dsp.sv.
-
-// Glue logic: decimation stage x8 (declarations moved up to axi_dsp's
-// own declaration block above -- same reasoning as dsp_clk's forward
-// declaration: xvlog requires declare-before-use even across a module
-// instantiation's port map, not just within a single always_ff block;
-// synth_design tolerates the original order fine, xvlog doesn't)
 logic  [2:0] dec_counter;
 
-// Whole block gated on adc_valid, not just the accumulate step: dec_counter
-// itself must only advance on real samples, or its wrap (dec_done) lands on
-// an arbitrary dsp_clk cycle instead of the 8th real one -- letting stale
-// leftovers from the previous window bleed into the next. One guard instead
-// of three repeated ones. dec_done can now stay high for several dsp_clk
-// cycles while waiting on the next real sample (no longer a guaranteed
-// single-cycle pulse) -- axi_dsp's own i_valid edge-detect already handles
-// that.
 always_ff @( posedge dsp_clk ) begin
     if (adc_valid) begin
         dec_counter <= dec_counter + 3'b1;
@@ -870,13 +791,6 @@ always_ff @( posedge dsp_clk ) begin
     if (~adc_status) error_count <= error_count + 8'd1;
 end
 
-// One raw RX sample (adc_data_i1's 8 MSBs -- axi_cdc_status's lanes are
-// only 8 bits, so the low 4 bits of the 12-bit ADC sample are dropped)
-// captured every 47th valid sample rather than every one, so this
-// register doesn't just keep landing on the same phase of whatever
-// periodic pattern is streaming (BIST/PRBS or otherwise) -- 47 doesn't
-// divide any of the standard PRBS periods (127, 511, 2047, 32767, ...)
-// or the frame-decode cycle, so the sampled phase keeps moving.
 logic [5:0] rx_decim_cnt;
 logic [7:0] rx_data_snapshot;
 always_ff @( posedge dsp_clk ) begin
@@ -890,28 +804,6 @@ always_ff @( posedge dsp_clk ) begin
     end
 end
 
-// Round-robin mirror into axi_cdc_status: one lane rewritten per dsp_clk
-// cycle, cycling through reg0 (RX data), reg1 (valid count), reg2 (error
-// count), reg3 (raw pre-decode rx_frame_s -- diagnostic, see below),
-// reg4-7 (dsp_counter, 32 bits split across 4 lanes, a dsp_clk-domain
-// heartbeat/"blinky" replacement), reg8-9 (raw pre-decode rx_data --
-// diagnostic). A full cycle is 10 dsp_clk cycles, far faster than any of
-// these values actually change, so the lag between a value updating and
-// its mirrored lane catching up is never meaningful here.
-//
-// reg3/reg8-9 exist to answer a question upstream of frame lock itself:
-// coarse REG_RX_CLOCK_DATA_DELAY sweeps (see [[project_trajectory]] in
-// project memory) produced zero change in valid_count across the whole
-// register range, which doesn't fit a simple timing-margin story -- these
-// mirror rx_frame_s/rx_data exactly as the frame-match logic in
-// ad3961_if_rx.sv sees them, ungated by adc_valid, so a raw capture can
-// show whether the LVDS interface is toggling near the expected pattern
-// (supports the timing theory) or is dead/stuck (points elsewhere).
-//
-// reg10-63 are deliberately left unused here -- reserved for the
-// correlator/histogram dsp_clk-domain modules planned for next session
-// (see [[project_trajectory]]), so they can mirror their own output into
-// axi_cdc_status the same way without another interface change.
 logic [3:0] cdc_mirror_seq;
 always_ff @( posedge dsp_clk ) begin
     cdc_mirror_seq <= (cdc_mirror_seq == 4'd9) ? 4'd0 : cdc_mirror_seq + 4'd1;
