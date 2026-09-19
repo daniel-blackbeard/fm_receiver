@@ -113,6 +113,7 @@ assign mpx_data_lowfreq = mpx_data_accum >>> 7;
 logic signed [15:0] mpx_data_desc;
 logic               mpx_valid;
 
+// We reduce the rate to 240KHz
 mpx_decimator u_mpx_dec (
     .clk      (clk),
     .rstb     (rstb & ~cfg0[29]),
@@ -142,7 +143,7 @@ pll u_pll (
 );
 
 logic               mpx_demod_valid;
-logic signed [15:0] mpx_demod_audio_r, mpx_demod_audio_l, mpx_demod_rds_data;
+logic signed [15:0] mpx_demod_audio_r, mpx_demod_audio_l;
 logic signed [15:0] mpx_demod_mono, mpx_demod_ster;
 
 mpx_demod u_mpx_demod (
@@ -154,17 +155,46 @@ mpx_demod u_mpx_demod (
     .i_vco1_cos  (pll_vco1_cos),
     .i_vco2_sin  (pll_vco2_sin),
     .i_vco2_cos  (pll_vco2_cos),
-    .i_vco3_sin  (pll_vco3_sin),
-    .i_vco3_cos  (pll_vco3_cos),
     .valid       (mpx_demod_valid),
     .o_audio_r   (mpx_demod_audio_r),
     .o_audio_l   (mpx_demod_audio_l),
-    .o_rds_data  (mpx_demod_rds_data),
     .o_mono      (mpx_demod_mono),
     .o_ster      (mpx_demod_ster)
 );
 
+// RDS downconversion: one DSP slice, mpx_data x 57kHz cosine, same
+// Q0.30->Q0.15 scaling convention as mpx_demod.sv's stereo mixer (this
+// used to live there; moved here since rds.sv's CIC needs the raw,
+// pre-filter mix, not mpx_demod's old (now-removed) weak single-pole
+// filtered version).
+logic signed [31:0] rds_mix;
+logic signed [15:0] rds_mix_i;
+logic pll_valid_d1;
+
+always_ff @(posedge clk) begin
+    if(~rstb) rds_mix <= '0;
+    else if(pll_valid) rds_mix <= mpx_data_desc * pll_vco3_cos;
+end
+assign rds_mix_i = rds_mix >>> 15;
+
+always_ff @(posedge clk) begin
+    if(~rstb) pll_valid_d1 <= '0;
+    else      pll_valid_d1 <= pll_valid;
+end
+
+logic               rds_valid;
+logic signed [15:0] rds_data;
+
+rds u_rds (
+    .clk        (clk),
+    .rstb       (rstb),
+    .i_mpx_data (rds_mix_i),
+    .strb       (pll_valid_d1),
+    .o_rds_data (rds_data),
+    .valid      (rds_valid)
+);
+
 assign o_valid = mpx_demod_valid;
-assign debug   = {mpx_demod_mono, mpx_demod_ster, mpx_demod_rds_data, pll_vco1_sin};
+assign debug   = {mpx_demod_audio_r, mpx_demod_audio_l, rds_data, pll_vco1_sin};
 
 endmodule

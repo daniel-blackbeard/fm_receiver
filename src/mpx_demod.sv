@@ -7,12 +7,9 @@ module mpx_demod (
     input  logic signed [15:0] i_vco1_cos,
     input  logic signed [15:0] i_vco2_sin,
     input  logic signed [15:0] i_vco2_cos,
-    input  logic signed [15:0] i_vco3_sin,
-    input  logic signed [15:0] i_vco3_cos,
     output logic               valid,
     output logic signed [15:0] o_audio_r,
     output logic signed [15:0] o_audio_l,
-    output logic signed [15:0] o_rds_data,
     // Pre-matrix-combine taps for diagnosis: mono (L+R, no downconversion
     // involved) vs ster (L-R, downconverted against vco2) -- a bad PLL
     // lock shows up far more clearly here than diluted into L/R.
@@ -34,8 +31,7 @@ end
 assign mpx_ster_i = mpx_ster_mix >>> 15;
 
 // Mirrors mpx_ster_mix's 1-cycle latency so mpx_fir sees mono/ster
-// aligned to the same original sample, not one strobe apart. Also
-// used below to time the RDS filter against mpx_rds_mix.
+// aligned to the same original sample, not one strobe apart.
 logic signed [15:0] mpx_mono_d1;
 logic strb_d1;
 always_ff @(posedge clk) begin
@@ -47,23 +43,6 @@ always_ff @(posedge clk) begin
         strb_d1 <= strb;
     end
 end
-
-// RDS downconversion: one DSP slice, mpx_data x 57kHz cosine. Same
-// Q0.30->Q0.15 scaling as the stereo mixer.
-logic signed [31:0] mpx_rds_mix;
-always_ff @(posedge clk) begin
-    if(~rstb) mpx_rds_mix <= '0;
-    else if(strb) mpx_rds_mix <= i_mpx_data * i_vco3_cos;
-end
-
-// Cheap 1-pole filter, pole ~2400Hz at 240kHz (k=4).
-logic signed [31:0] mpx_rds_mix_lpf;
-always_ff @(posedge clk) begin
-    if(~rstb) mpx_rds_mix_lpf <= '0;
-    else if(strb_d1) mpx_rds_mix_lpf <= mpx_rds_mix_lpf + ((mpx_rds_mix - mpx_rds_mix_lpf) >>> 4);
-end
-
-assign o_rds_data = mpx_rds_mix_lpf >>> 15;
 
 logic fir_valid;
 logic signed [15:0] fir_audio_mono, fir_audio_ster;

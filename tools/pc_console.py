@@ -93,19 +93,22 @@ from sample_stream_view import (
 # (it's also the dict key into SampleReceiver's buffers), this only renames
 # what's shown in plot titles.
 #
-# 2026-09-18: temporarily swapped from R/L to pre-matrix-combine mono/ster
-# (dsp.sv's debug now sends mono=L+R, ster=L-R instead of R/L) -- a bad
-# PLL lock/downconversion shows up in ster far more clearly than once
-# diluted into both L and R. Revert to Right/Left once this diagnosis is
-# done, see mpx_demod.sv/dsp.sv for the actual signal swap.
+# 2026-09-19: dsp.sv's debug bus is back to real R/L audio (mono/ster
+# diagnostic swap reverted), and ch1_i now carries rds.sv's properly
+# decimated+scaled RDS output instead of the old raw/unfiltered tap.
 CHANNEL_DISPLAY_NAMES = {
-    "ch0_i": "Mono (L+R)",
-    "ch0_q": "Ster (L-R)",
-    "ch1_i": "RDS (raw)",
-    "ch1_q": "VCO1 (sin)",  # was "Spare", then RDS downconvert experiment
-                              # (removed 2026-09-18) -- now dsp.sv's raw
-                              # pll_vco1_sin, a direct PLL sanity check.
+    "ch0_i": "R",
+    "ch0_q": "L",
+    "ch1_i": "RDS",
+    "ch1_q": "VCO1 (sin)",  # dsp.sv's raw pll_vco1_sin, a direct PLL sanity check.
 }
+
+# Eye diagrams are only enabled for this one channel (2026-09-19) -- the
+# redraw was previously suspected of contending with the audio thread for
+# the GIL, so it's off by default for the other three; RDS is the one
+# channel currently worth watching for eye-diagram purposes (timing
+# recovery work). See _eye_update().
+EYE_DIAGRAM_CHANNEL = "ch1_i"
 
 # Which sample-stream channel carries the raw pll_vco1_sin tap -- the FFT
 # tab annotates this one panel with the pilot tone's measured frequency
@@ -875,12 +878,19 @@ class ConsoleApp:
         samples-per-eye and persistence; at this ~200ms cadence the
         redraw cost is dominated by how many overlaid lines get drawn
         (each eye window is its own line artist), which is exactly what
-        eye_persistence caps -- not by the redraw mechanism itself."""
+        eye_persistence caps -- not by the redraw mechanism itself.
+
+        Only EYE_DIAGRAM_CHANNEL actually redraws (2026-09-19) -- the
+        other three panels are left completely untouched (no cla(), no
+        replot) so they stay blank rather than costing redraw time for
+        eyes nobody's currently looking at."""
         if self.sample_recv is None:
             return
         n = self.eye_samples_per_eye
         persistence = self.eye_persistence
         for ax, name in zip(self.eye_axes.flat, CHANNEL_NAMES):
+            if name != EYE_DIAGRAM_CHANNEL:
+                continue
             ax.cla()
             ax.set_title(CHANNEL_DISPLAY_NAMES[name])
             ax.set_xlabel("Sample index within eye")
@@ -1112,14 +1122,14 @@ class ConsoleApp:
         )
         self.sample_canvas.draw_idle()
 
-        # Disabled again 2026-09-18: testing whether this redraw's matplotlib/
-        # GIL load is the real cause of the audio beat -- RTL (PLL windup,
-        # reset polarity) and sample-rate mismatch are both ruled out at
-        # this point, and the only variable that's ever correlated with the
-        # beat coming and going is restarting pc_console.py itself, which
-        # points at something in this process, not the signal. See prior
-        # enable/disable history in this file for the toggle pattern.
-        # self._eye_update(data)
+        # Re-enabled 2026-09-19, scoped to RDS only (see EYE_DIAGRAM_CHANNEL):
+        # was disabled 2026-09-18 on suspicion of matplotlib/GIL contention
+        # with the audio thread being the real cause of an audio beat (RTL
+        # causes were ruled out first). Redrawing only one of the four
+        # panels instead of all four is a meaningfully smaller redraw load;
+        # if the beat comes back, that's a data point on whether it was
+        # ever really about redraw cost vs. something else in this process.
+        self._eye_update(data)
 
     def _on_close(self):
         self._stop_sample_stream()
