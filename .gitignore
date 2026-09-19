@@ -36,3 +36,16 @@ private/
 
 # Python bytecode cache
 __pycache__/
+
+# Build flow, pin/timing constraints, PS7 block design, and internal
+# docs -- this repo tracks RTL (src/*.sv, *.hex), testbenches (tb/),
+# tools (tools/), firmware (sw/), and README.md only. Everything below
+# stays local (not needed to replicate the build or reuse the code).
+scripts/
+constraints/
+src/PS/
+setup_env.bat
+setup_env.ps1
+explanation.md
+rds_decoding.md
+bringup_log.md

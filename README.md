@@ -30,8 +30,7 @@ included.
 4. **Decodes RDS**: the 57kHz RDS subcarrier is downconverted and
    CIC-decimated in RTL; the rest of the RDS chain (filtering, symbol
    timing recovery, block sync, protocol decode) currently runs
-   offline in Python against the same live sample stream — see
-   `rds_decoding.md` for the plan to port that into RTL.
+   offline in Python against the same live sample stream.
 5. **Streams every stage out over Ethernet** (UDP) for live monitoring,
    audio playback, and analysis on a PC — no vendor debug core, no ILA
    needed for day-to-day work.
@@ -120,7 +119,6 @@ src/
   axi_cdc_status.sv            dsp_clk-domain read-only status regmap
   axi_dsp.sv                    streams demodulated channels to DDR
   axi_notifications.sv           PL->PS "new data" signaling, no DMA/IRQ needed
-  PS/bd/design_1/                versioned PS7 block design (source of truth)
 tb/                       one testbench per RTL module of note (cycle-accurate,
                            golden-vector or synthetic-stimulus verified before
                            anything gets trusted on real hardware)
@@ -128,7 +126,6 @@ sw/
   startup.S / linker.ld / main.c   bare-metal ARM Cortex-A9 app, no OS/FSBL/libc
   eth0.c / eth0.h                   bare-metal GEM (Ethernet) MAC driver
   build.bat                          assembles/links into sw/build/fm_axi_test.elf
-scripts/                  Vivado batch-mode build flow + xsdb JTAG bring-up scripts
 tools/
   pc_console.py            main live console: FFT/eye-diagram display, AXI regmap
                             tab, audio playback, sample-rate stats
@@ -139,48 +136,21 @@ tools/
   gen_sincos_lut.py / gen_fir_taps.py / gen_mono_lpf_taps.py / gen_pll_stim.py
                               coefficient/LUT/stimulus generators for the RTL above
   soak_udp_traffic.py        long-running UDP traffic generator for soak testing
-constraints/constraints.xdc   pin assignments + timing constraints
 ```
 
-## Prerequisites
+This repo covers the RTL, firmware, testbenches, and PC-side tools —
+the actual code. The Vivado build flow, pin/timing constraints, and PS7
+block design used to build and deploy this locally are not included
+here.
 
-- **Vivado 2025.2.1**, installed at `C:\AMDDesignTools\2025.2.1` (path
-  hardcoded in `scripts/env.bat`, update there if your install differs).
-- **Arm GNU Toolchain** (`arm-none-eabi-gcc`/`-ld`/`-objcopy`) on `PATH`.
-- **`xsdb`** (Xilinx System Debugger, ships with Vivado/Vitis) on `PATH`
-  for the JTAG bring-up scripts.
-- **Python** (MSYS2 UCRT64 recommended) with `numpy`, `scipy`,
-  `matplotlib`, `sounddevice` for the `tools/` scripts.
-- Board connected over JTAG and powered on.
+## Tools
 
-## Build & bring-up sequence
-
-Run via VS Code's Command Palette → "Tasks: Run Task":
-
-1. **`Vivado: Configure PS7 Clocks (modifies src/PS)`** — only needed
-   once, or after deliberately changing PS7 config.
-2. **`Vivado: Full Flow`** — synthesis → implementation → bitstream,
-   producing `output/vivado/bitstream/*.bit`.
-3. **`Vivado: Program FPGA`** — downloads the bitstream over JTAG
-   (configures the PL fabric only; PS7's own state is untouched).
-4. **`XSDB: Init PS7 over JTAG`** — brings up PS7's clocks/DDR
-   controller over JTAG (no FSBL in this flow, so nothing else does
-   this). **Must run exactly once per power-on session**, after
-   `Program FPGA` and before anything DDR-dependent.
-5. **`SW: Build Bare-Metal App`** — builds `sw/` into
-   `sw/build/fm_axi_test.elf`. Independent of steps 1–4.
-6. **`XSDB: Load & Run Bare-Metal App`** — loads the ELF into DDR and
-   starts the core. Repeatable: loop steps 5→6 while iterating on
-   `sw/main.c` without re-touching the FPGA side, as long as step 4
-   hasn't been undone by a power cycle.
-
-`Vivado: Simulate` runs `scripts/sim.tcl`, which elaborates whichever
-testbench its `set tb "..."` line names.
-
-Once the board is running and reachable over Ethernet, point
-`tools/pc_console.py` at it for live monitoring, tuning, and audio;
-`tools/rds_decode.py`/`tools/rds_autocorr.py` read the same stream for
-RDS analysis.
+Point `tools/pc_console.py` at a running board (over Ethernet) for live
+monitoring, tuning, and audio playback; `tools/rds_decode.py`/
+`tools/rds_autocorr.py` read the same UDP sample stream for RDS
+analysis. `tools/pc_console.py`'s own docstring documents the wire
+protocol (UART and UDP both speak the same 8-byte register command
+format).
 
 ## Status
 
@@ -188,21 +158,4 @@ The full chain — SPI/RX digital bring-up, digital tuning, FM
 discrimination, pilot-locked stereo, and RDS reception — is
 hardware-confirmed end to end. The RDS protocol decode (biphase demod
 through PI/PS extraction) currently lives in Python as the reference
-implementation; porting it into RTL is planned and staged in
-`rds_decoding.md`.
-
-For the detailed PS7/AXI/UART/AD9361/JTAG bring-up history — gotchas,
-bugs found and fixed, full register/address-map reference — see
-`bringup_log.md`.
-
-## Other docs in this repo
-
-- `bringup_log.md` — detailed PS7/AXI/UART/AD9361/JTAG bring-up log:
-  register-level protocol reference, address maps, and the full history
-  of bugs found and fixed getting there.
-- `rds_decoding.md` — staged plan for porting the RDS decode chain
-  (currently Python) into RTL.
-- `explanation.md` — field-by-field breakdown of what's inside
-  `design_1.bd`/`.xci`. Predates the DSP/software phases above.
-- `blinky.md` — the original phased plan for the very first
-  register-to-LED milestone. Complete; kept for history.
+implementation; porting it into RTL is a planned next step.
