@@ -96,19 +96,69 @@ from sample_stream_view import (
 # 2026-09-19: dsp.sv's debug bus is back to real R/L audio (mono/ster
 # diagnostic swap reverted), and ch1_i now carries rds.sv's properly
 # decimated+scaled RDS output instead of the old raw/unfiltered tap.
+#
+# 2026-09-21: ch1_i no longer carries a signal at all -- dsp.sv sends the
+# decoded RDS registers as {addr, byte} words on it (see RDS_ADDR_* below),
+# so it has no FFT panel (and the eye-diagram tab is gone). The audio
+# channels arrive already separated by the hardware (R and L).
 CHANNEL_DISPLAY_NAMES = {
-    "ch0_i": "R",
-    "ch0_q": "L",
-    "ch1_i": "RDS",
+    "ch0_i": "Audio R",
+    "ch0_q": "Audio L",
+    "ch1_i": "RDS data (addr:byte words)",
     "ch1_q": "VCO1 (sin)",  # dsp.sv's raw pll_vco1_sin, a direct PLL sanity check.
 }
 
-# Eye diagrams are only enabled for this one channel (2026-09-19) -- the
-# redraw was previously suspected of contending with the audio thread for
-# the GIL, so it's off by default for the other three; RDS is the one
-# channel currently worth watching for eye-diagram purposes (timing
-# recovery work). See _eye_update().
-EYE_DIAGRAM_CHANNEL = "ch1_i"
+# Channels that get an FFT panel (everything except the RDS data channel).
+FFT_CHANNELS = ("ch0_i", "ch0_q", "ch1_q")
+
+# --- Decoded RDS over ch1_i (2026-09-21; mirrors src/dsp.sv's RDS_SCAN) ------
+# Every 16-bit sample on that channel is {1'b0, addr[6:0], byte[7:0]}: a
+# free-running scan of the FPGA's decoded registers. The PC keeps a byte
+# table indexed by addr, so no framing/sync is needed and lost samples are
+# simply refreshed on the next sweep.
+RDS_CHANNEL        = "ch1_i"
+RDS_ADDR_PI        = 0    # 2 bytes: PI high, PI low
+RDS_ADDR_PS        = 2    # 8 bytes: Programme Service name
+RDS_ADDR_RT        = 10   # 64 bytes: RadioText
+RDS_ADDR_STATUS    = 74   # bit 0 = block-sync lock
+RDS_N_ENTRIES      = RDS_ADDR_STATUS + 1
+RDS_PS_LEN         = 8
+RDS_RT_LEN         = 64
+
+
+def rds_apply_words(table, seen, words):
+    """Write a batch of raw 16-bit samples ({addr, byte}) into the byte
+    `table` and mark `seen`, in order (the newest sample for an address
+    wins). Samples whose address is outside the map are ignored."""
+    for w in words:
+        w = int(w)
+        addr = (w >> 8) & 0xFF
+        if addr < RDS_N_ENTRIES:
+            table[addr] = w & 0xFF
+            seen[addr] = True
+
+
+def rds_text(chars):
+    """Printable view of decoded characters: 0x00 (not received yet) shows
+    as '_', other non-printables as '?'."""
+    out = []
+    for b in chars:
+        b = int(b)
+        out.append("_" if b == 0 else (chr(b) if 32 <= b < 127 else "?"))
+    return "".join(out)
+
+
+def rds_summary(table, seen):
+    """(pi_text, ps_text, rt_text, status_text) for the display panel."""
+    n_seen = sum(1 for i in range(RDS_N_ENTRIES) if seen[i])
+    if n_seen < RDS_N_ENTRIES:
+        waiting = f"waiting for the RDS data channel ({n_seen}/{RDS_N_ENTRIES} entries seen)"
+        return "----", "--------", "", waiting
+    pi = (int(table[RDS_ADDR_PI]) << 8) | int(table[RDS_ADDR_PI + 1])
+    ps = rds_text(table[RDS_ADDR_PS:RDS_ADDR_PS + RDS_PS_LEN])
+    rt = rds_text(table[RDS_ADDR_RT:RDS_ADDR_RT + RDS_RT_LEN]).rstrip("_")
+    locked = bool(table[RDS_ADDR_STATUS] & 1)
+    return f"0x{pi:04X}", ps, rt if rt else "(none yet)", "LOCKED" if locked else "not locked"
 
 # Which sample-stream channel carries the raw pll_vco1_sin tap -- the FFT
 # tab annotates this one panel with the pilot tone's measured frequency
@@ -238,6 +288,42 @@ PLL_LOCK_REGS = {
 # not itself a tuning limit.
 RX_LO_MIN_MHZ = 60.0
 RX_LO_MAX_MHZ = 130.0
+
+# --- Station tuning through the NCO phase step (AXI RM 0x0C), 2026-09-21 -----
+# The AD9361 RX LO stays fixed at 98MHz (nothing in this tool touches it any
+# more), and the station is selected digitally: dsp.sv's mixer computes
+# (i + jq) * (cos - j sin) of the NCO phase, so a POSITIVE phase step moves a
+# station above the LO down to DC. With the phase accumulator 32 bits wide
+# and clocked at dsp_clk (30.000MHz, i.e. 1.2MHz x 25 -- the measured
+# 9.6MB/s stream), a station offset from the LO maps to
+#     phase_step = round(offset_hz / DSP_CLK_HZ * 2^32)   (mod 2^32)
+# Offset 0 (station == LO, 98MHz) is phase_step 0, which is the startup state
+# this tool assumes -- it never reads or writes 0x0C until a button is pressed.
+STATION_CENTER_HZ = 98_000_000
+DSP_CLK_HZ = 30_000_000
+AXI_ADDR_PHASE_STEP = 0x0C
+# Fine/medium/coarse steps, in kHz, shown left to right as the six buttons.
+TUNE_STEPS_KHZ = (-250, -25, -10, 10, 25, 250)
+# The mixer sees +-dsp_clk/2 around the LO (83-113MHz). +15000kHz would land
+# exactly on Nyquist where the phase word wraps onto -15000kHz, so the upper
+# limit stops one step short of it.
+TUNE_MIN_OFFSET_KHZ = -DSP_CLK_HZ // 2000
+TUNE_MAX_OFFSET_KHZ = DSP_CLK_HZ // 2000 - 10
+
+
+def station_phase_step(offset_hz):
+    """Two's-complement 32-bit NCO phase step for a station `offset_hz`
+    away from the (fixed) RX LO."""
+    return round(offset_hz * (1 << 32) / DSP_CLK_HZ) & 0xFFFFFFFF
+
+
+def phase_step_to_offset_hz(word):
+    """Inverse of station_phase_step(): the frequency a raw 32-bit phase
+    step (as read back from 0x0C) actually represents."""
+    word &= 0xFFFFFFFF
+    if word & 0x80000000:
+        word -= 1 << 32
+    return word * DSP_CLK_HZ / (1 << 32)
 
 # Known AXI (axi_registers) offsets -- source of truth is fm_receiver.sv's
 # own "RM 0x.." comments next to each regmap assignment. Extend this list
@@ -372,9 +458,10 @@ class ConsoleApp:
         self.state = {}
 
         # Toggle buttons across every tab that shows sample-stream data
-        # (FFT, eye diagram) -- all drive the one shared SampleReceiver
-        # (self.sample_recv), so their labels are kept in sync together
-        # rather than each tab owning its own receiver/socket.
+        # (the FFT tab; the eye-diagram tab was removed 2026-09-21) -- all
+        # drive the one shared SampleReceiver (self.sample_recv), so their
+        # labels are kept in sync together rather than each tab owning its
+        # own receiver/socket.
         self._sample_toggle_btns = []
         self._rate_last_t = 0.0
         self._rate_last_pkts = 0
@@ -396,16 +483,13 @@ class ConsoleApp:
         self.console_tab = ttk.Frame(notebook)
         self.regmap_tab = ttk.Frame(notebook)
         self.sample_tab = ttk.Frame(notebook)
-        self.eye_tab = ttk.Frame(notebook)
         notebook.add(self.console_tab, text="Command Console")
         notebook.add(self.regmap_tab, text="AXI Regmap")
         notebook.add(self.sample_tab, text="RX Sample Stream (FFT)")
-        notebook.add(self.eye_tab, text="Eye Diagram")
 
         self._build_console_tab()
         self._build_regmap_tab()
         self._build_sample_tab()
-        self._build_eye_tab()
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -451,14 +535,24 @@ class ConsoleApp:
     def _build_console_tab(self):
         f = self.console_tab
 
-        tune_frame = ttk.LabelFrame(f, text="Tune RX LO (FM station)")
+        # Station tuning (2026-09-21): replaces the old "Tune RX LO" frame (the
+        # AD9361 LO is fixed at 98MHz now, so that control is no longer shown;
+        # _on_tune_rx_lo() below is kept only as history). The six buttons move
+        # the station by a fixed step and write the matching NCO phase step to
+        # AXI 0x0C -- see the STATION_*/TUNE_* constants for the conversion.
+        tune_frame = ttk.LabelFrame(f, text="Station tuning")
         tune_frame.pack(fill="x", padx=8, pady=(8, 0))
-        ttk.Label(tune_frame, text="Frequency (MHz):").grid(row=0, column=0, sticky="e", padx=4, pady=4)
-        self.rx_lo_mhz_var = tk.StringVar(value="98.0")
-        ttk.Entry(tune_frame, textvariable=self.rx_lo_mhz_var, width=10).grid(row=0, column=1, padx=4, pady=4)
-        ttk.Button(tune_frame, text="Tune", command=self._on_tune_rx_lo).grid(row=0, column=2, padx=4, pady=4)
-        self.rx_lo_status_var = tk.StringVar(value="")
-        ttk.Label(tune_frame, textvariable=self.rx_lo_status_var).grid(row=0, column=3, sticky="w", padx=8)
+        self.station_offset_khz = 0          # startup state: station == LO, phase step 0
+        self.station_freq_var = tk.StringVar(value=self._station_text())
+        ttk.Label(tune_frame, textvariable=self.station_freq_var,
+                  font=("Consolas", 16, "bold")).grid(row=0, column=0, columnspan=8, sticky="w", padx=8, pady=(4, 0))
+        for col, step in enumerate(TUNE_STEPS_KHZ):
+            ttk.Button(tune_frame, text=f"{step:+d}", width=7,
+                       command=lambda s=step: self._on_station_step(s)).grid(row=1, column=col, padx=4, pady=6)
+        ttk.Label(tune_frame, text="kHz").grid(row=1, column=len(TUNE_STEPS_KHZ), sticky="w", padx=(2, 8))
+        self.station_status_var = tk.StringVar(value="phase step 0x00000000 (not written yet)")
+        ttk.Label(tune_frame, textvariable=self.station_status_var).grid(
+            row=2, column=0, columnspan=8, sticky="w", padx=8, pady=(0, 4))
 
         mode_frame = ttk.LabelFrame(f, text="System mode")
         mode_frame.pack(fill="x", padx=8, pady=(8, 0))
@@ -534,7 +628,47 @@ class ConsoleApp:
         scroll.pack(fill="y", side="right")
         self.log.config(yscrollcommand=scroll.set)
 
+    def _station_text(self):
+        """Current station shown in the tuning frame, from the tracked offset."""
+        mhz = (STATION_CENTER_HZ + self.station_offset_khz * 1000) / 1e6
+        return f"{mhz:.3f} MHz"
+
+    def _on_station_step(self, delta_khz):
+        """One of the six tuning buttons: move the station by delta_khz, write
+        the new NCO phase step to AXI 0x0C (write + readback, like the Send
+        panel) and only then update the shown frequency. If the board does not
+        answer, the shown frequency is left alone and the status line says the
+        board may no longer match it."""
+        new_khz = max(TUNE_MIN_OFFSET_KHZ, min(TUNE_MAX_OFFSET_KHZ, self.station_offset_khz + delta_khz))
+        if new_khz == self.station_offset_khz:
+            self.station_status_var.set("At the limit of the tunable range (83-113 MHz)")
+            return
+        word = station_phase_step(new_khz * 1000)
+        dev = DEVICES["AXI (axi_registers)"]
+        try:
+            write_cmd = self.link.pack_command(dev, CMD_RW_WRITE, AXI_ADDR_PHASE_STEP, word)
+            read_cmd = self.link.pack_command(dev, CMD_RW_READ, AXI_ADDR_PHASE_STEP, 0)
+            (readback,) = self.link.send_commands([write_cmd, read_cmd], expected_replies=1)
+        except socket.timeout:
+            self.station_status_var.set("No reply from the board -- shown frequency may not match it")
+            self._log(f"TIMEOUT tuning by {delta_khz:+d} kHz (phase step 0x{word:08X})")
+            return
+        except (OSError, ValueError) as exc:
+            self.station_status_var.set(f"ERROR: {exc}")
+            self._log(f"ERROR tuning by {delta_khz:+d} kHz: {exc}")
+            return
+        self.station_offset_khz = new_khz
+        self.state[(dev, AXI_ADDR_PHASE_STEP)] = readback
+        self.station_freq_var.set(self._station_text())
+        ok = "readback OK" if readback == word else f"READBACK MISMATCH 0x{readback:08X}"
+        self.station_status_var.set(f"{delta_khz:+d} kHz -> phase step 0x{word:08X} ({ok})")
+        self._log(f"TUNE {delta_khz:+d} kHz -> {self._station_text()} "
+                  f"(offset {new_khz:+d} kHz, phase step 0x{word:08X}, readback 0x{readback:08X})")
+        self._refresh_regmap_display()
+
     def _on_tune_rx_lo(self):
+        # UI removed 2026-09-21 (RX LO is fixed at 98MHz); kept for history and
+        # NOT wired to anything -- its rx_lo_* variables no longer exist.
         # ad9361_rx_lo_synth_set() (sw/main.c) is NOT YET hardware-verified
         # for any frequency other than the 98MHz boot default -- see
         # private/ad9361_registers.md's "RX LO frequency tuning" section.
@@ -746,7 +880,7 @@ class ConsoleApp:
         # not a "pick whichever looks right" setting. Applied fresh every
         # _sample_update() tick (see cast_signed()), never baked into the
         # receiver's stored buffer -- so it takes effect immediately and
-        # identically across the FFT and eye diagram tabs, with no risk of
+        # identically across every consumer of the buffers, with no risk of
         # a buffer holding a stale mix of both interpretations. No command
         # callback needed: the next poll tick (<=200ms) just reads this
         # StringVar fresh.
@@ -773,14 +907,31 @@ class ConsoleApp:
             self.audio_status_var = tk.StringVar(value="")
         ttk.Label(ctrl, textvariable=self.audio_status_var).pack(side="left")
 
-        fig = Figure(figsize=(9, 6))
-        axes = fig.subplots(2, 2)
+        # Decoded RDS (2026-09-21): packed at the bottom BEFORE the canvas so it
+        # always keeps its size and the plots take whatever is left. Filled by
+        # _rds_update() from the ch1_i {addr, byte} words (see RDS_ADDR_*).
+        rds_box = ttk.LabelFrame(f, text="RDS (decoded on the FPGA)")
+        rds_box.pack(side="bottom", fill="x", padx=8, pady=(0, 8))
+        self.rds_table = bytearray(256)
+        self.rds_seen = [False] * 256
+        self.rds_pi_var = tk.StringVar(value="----")
+        self.rds_ps_var = tk.StringVar(value="--------")
+        self.rds_rt_var = tk.StringVar(value="")
+        self.rds_status_var = tk.StringVar(value="not listening")
+        mono = ("Courier New", 11)
+        for row, (label, var) in enumerate((("PI", self.rds_pi_var), ("PS", self.rds_ps_var),
+                                            ("RT", self.rds_rt_var), ("Status", self.rds_status_var))):
+            ttk.Label(rds_box, text=f"{label}:", font=mono, width=7).grid(row=row, column=0, sticky="w", padx=(8, 0))
+            ttk.Label(rds_box, textvariable=var, font=mono).grid(row=row, column=1, sticky="w", padx=8)
+
+        fig = Figure(figsize=(10, 4))
+        axes = fig.subplots(1, len(FFT_CHANNELS))
         self.sample_freqs_khz = np.fft.rfftfreq(DEFAULT_FFT_SIZE, d=1.0 / AUDIO_OUT_RATE_HZ) / 1e3
         self.sample_window = np.hanning(DEFAULT_FFT_SIZE)
         self.sample_axes = axes
         self.sample_lines = {}
         self.sample_tone_text = None
-        for ax, name in zip(axes.flat, CHANNEL_NAMES):
+        for ax, name in zip(axes.flat, FFT_CHANNELS):
             (line,) = ax.plot(self.sample_freqs_khz, np.zeros_like(self.sample_freqs_khz))
             ax.set_title(CHANNEL_DISPLAY_NAMES[name])
             ax.set_xlabel("Freq (kHz)")
@@ -799,113 +950,6 @@ class ConsoleApp:
         self.sample_canvas.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
     # ------------------------------------------------------------------
-    def _build_eye_tab(self):
-        f = self.eye_tab
-
-        ctrl = ttk.Frame(f)
-        ctrl.pack(fill="x", padx=8, pady=8)
-        self.eye_status_var = tk.StringVar(value="Not listening")
-        ttk.Label(ctrl, textvariable=self.eye_status_var).pack(side="left")
-        eye_toggle_btn = ttk.Button(ctrl, text="Start listening", command=self._toggle_sample_stream)
-        eye_toggle_btn.pack(side="right")
-        self._sample_toggle_btns.append(eye_toggle_btn)
-
-        # Samples per eye: width of each overlaid trace, in raw decimated
-        # samples (not seconds) -- the receiver has no symbol-timing
-        # recovery, so this is a manual "how many samples make one eye
-        # width" guess, not a locked-in symbol period. Default of 32 is
-        # just a reasonable starting point to try, not derived from
-        # anything.
-        ttk.Label(ctrl, text="Samples per eye:").pack(side="left", padx=(16, 4))
-        self.eye_samples_var = tk.StringVar(value="32")
-        eye_entry = ttk.Entry(ctrl, textvariable=self.eye_samples_var, width=8)
-        eye_entry.pack(side="left")
-        eye_entry.bind("<Return>", self._on_eye_samples_change)
-        eye_entry.bind("<FocusOut>", self._on_eye_samples_change)
-        self.eye_samples_per_eye = 32
-
-        # Persistence: how many overlaid eyes to actually draw, capped
-        # rather than using every complete eye the buffer holds -- each
-        # eye is a separate matplotlib line artist, and drawing 32+
-        # semi-transparent overlapping lines per channel per ~200ms tick
-        # is the real CPU cost here, not the array slicing. Only the last
-        # samples_per_eye*persistence samples are ever touched.
-        ttk.Label(ctrl, text="Eye windows (persistence):").pack(side="left", padx=(16, 4))
-        self.eye_persistence_var = tk.StringVar(value="16")
-        persistence_entry = ttk.Entry(ctrl, textvariable=self.eye_persistence_var, width=8)
-        persistence_entry.pack(side="left")
-        persistence_entry.bind("<Return>", self._on_eye_persistence_change)
-        persistence_entry.bind("<FocusOut>", self._on_eye_persistence_change)
-        self.eye_persistence = 16
-
-        fig = Figure(figsize=(9, 6))
-        axes = fig.subplots(2, 2)
-        self.eye_axes = axes
-        for ax, name in zip(axes.flat, CHANNEL_NAMES):
-            ax.set_title(CHANNEL_DISPLAY_NAMES[name])
-            ax.set_xlabel("Sample index within eye")
-            ax.set_ylabel("Amplitude")
-        fig.tight_layout()
-
-        self.eye_canvas = FigureCanvasTkAgg(fig, master=f)
-        self.eye_canvas.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=(0, 8))
-
-    def _on_eye_samples_change(self, _event=None):
-        try:
-            n = int(self.eye_samples_var.get())
-            if n <= 1:
-                raise ValueError
-        except ValueError:
-            self.eye_samples_var.set(str(self.eye_samples_per_eye))  # revert to last-good
-            return
-        self.eye_samples_per_eye = n
-
-    def _on_eye_persistence_change(self, _event=None):
-        try:
-            p = int(self.eye_persistence_var.get())
-            if p < 1:
-                raise ValueError
-        except ValueError:
-            self.eye_persistence_var.set(str(self.eye_persistence))  # revert to last-good
-            return
-        self.eye_persistence = p
-
-    def _eye_update(self, data):
-        """Redrawn every sample-stream poll tick, reusing the same
-        snapshot() call _sample_update() already made -- no extra lock
-        contention with the receiver thread. Full clear-and-replot each
-        tick (not set_ydata()) since the trace *count* changes with
-        samples-per-eye and persistence; at this ~200ms cadence the
-        redraw cost is dominated by how many overlaid lines get drawn
-        (each eye window is its own line artist), which is exactly what
-        eye_persistence caps -- not by the redraw mechanism itself.
-
-        Only EYE_DIAGRAM_CHANNEL actually redraws (2026-09-19) -- the
-        other three panels are left completely untouched (no cla(), no
-        replot) so they stay blank rather than costing redraw time for
-        eyes nobody's currently looking at."""
-        if self.sample_recv is None:
-            return
-        n = self.eye_samples_per_eye
-        persistence = self.eye_persistence
-        for ax, name in zip(self.eye_axes.flat, CHANNEL_NAMES):
-            if name != EYE_DIAGRAM_CHANNEL:
-                continue
-            ax.cla()
-            ax.set_title(CHANNEL_DISPLAY_NAMES[name])
-            ax.set_xlabel("Sample index within eye")
-            ax.set_ylabel("Amplitude")
-            buf = data[name]
-            num_eyes = min(len(buf) // n, persistence)
-            if num_eyes < 1:
-                continue
-            trimmed = buf[-(num_eyes * n):].reshape(num_eyes, n)
-            x = np.arange(n)
-            for trace in trimmed:
-                ax.plot(x, trace, color="C0", alpha=0.15, linewidth=0.8)
-        self.eye_status_var.set(f"{self.sample_recv.packets_received} pkts received")
-        self.eye_canvas.draw_idle()
-
     def _on_sample_rate_change(self, _event=None):
         try:
             rate_hz = float(self.sample_rate_var.get())
@@ -933,6 +977,8 @@ class ConsoleApp:
                 self.sample_status_var.set(f"ERROR binding :{SAMPLE_PORT}: {exc}")
                 return
             self.sample_recv.start()
+            self.rds_table[:] = bytes(256)      # fresh RDS mirror for this listening session
+            self.rds_seen = [False] * 256
             self._rate_last_t = time.monotonic()
             self._rate_last_pkts = 0
             self._rate_last_bytes = 0
@@ -960,7 +1006,7 @@ class ConsoleApp:
         for btn in self._sample_toggle_btns:
             btn.config(text="Start listening")
         self.sample_status_var.set("Not listening")
-        self.eye_status_var.set("Not listening")
+        self.rds_status_var.set("not listening")
 
     def _on_audio_toggle(self):
         """Checkbox callback. Off by default -- see _build_sample_tab().
@@ -1038,7 +1084,7 @@ class ConsoleApp:
             return
         # Whole body wrapped try/finally (2026-09-18): this reschedules
         # itself at the end, so any uncaught exception here previously
-        # killed the entire redraw loop silently (FFT, eye diagram, rate
+        # killed the entire redraw loop silently (FFT, RDS panel, rate
         # display, everything) -- not just whatever pane actually broke.
         # finally guarantees the next tick still fires regardless; the
         # except surfaces the error in the status bar instead of losing
@@ -1057,11 +1103,11 @@ class ConsoleApp:
         # and rate_counter.py proved the earlier rate cap/jitter was this
         # tool's own GIL/rendering contention, not FPGA/firmware throughput
         # -- so the redraw is no longer suspected as a source of packet loss.
-        data = self.sample_recv.snapshot()
-        # Cast applied here, once, fresh every tick -- both the FFT loop
-        # below and _eye_update() consume this same already-cast `data`,
-        # so the two tabs can never disagree about which interpretation
-        # is currently showing.
+        raw = self.sample_recv.snapshot()
+        data = raw
+        # Cast applied here, once, fresh every tick, for the FFT loop below.
+        # The RDS decoder always works on `raw` (the untouched unsigned
+        # words): its samples are {addr, byte} pairs, not signed signals.
         if self.sample_signed_var.get() == "signed":
             data = {name: cast_signed(buf) for name, buf in data.items()}
 
@@ -1122,14 +1168,21 @@ class ConsoleApp:
         )
         self.sample_canvas.draw_idle()
 
-        # Re-enabled 2026-09-19, scoped to RDS only (see EYE_DIAGRAM_CHANNEL):
-        # was disabled 2026-09-18 on suspicion of matplotlib/GIL contention
-        # with the audio thread being the real cause of an audio beat (RTL
-        # causes were ruled out first). Redrawing only one of the four
-        # panels instead of all four is a meaningfully smaller redraw load;
-        # if the beat comes back, that's a data point on whether it was
-        # ever really about redraw cost vs. something else in this process.
-        self._eye_update(data)
+        self._rds_update(raw[RDS_CHANNEL])
+
+    def _rds_update(self, raw_words):
+        """Fold the latest ch1_i window ({addr, byte} words, oldest to
+        newest) into the RDS byte table and refresh the decoded-RDS panel.
+        Windows overlap poorly with the ~200ms poll (each is only the last
+        1024 samples = 21ms), but the FPGA sweeps all 75 entries every
+        1.56ms, so every window carries a complete refresh."""
+        if len(raw_words):
+            rds_apply_words(self.rds_table, self.rds_seen, raw_words.astype(np.uint16))
+        pi, ps, rt, status = rds_summary(self.rds_table, self.rds_seen)
+        self.rds_pi_var.set(pi)
+        self.rds_ps_var.set(f"'{ps}'" if ps.strip("-") else ps)
+        self.rds_rt_var.set(f"'{rt}'" if rt and not rt.startswith("(") else rt)
+        self.rds_status_var.set(status)
 
     def _on_close(self):
         self._stop_sample_stream()

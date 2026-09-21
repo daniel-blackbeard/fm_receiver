@@ -182,19 +182,77 @@ always_ff @(posedge clk) begin
     else      pll_valid_d1 <= pll_valid;
 end
 
-logic               rds_valid;
-logic signed [15:0] rds_data;
+logic        [15:0] rds_pi;
+logic        [63:0] rds_ps;
+logic       [511:0] rds_rt;
+logic               rds_locked;
 
+// Only the decoded results (S8) and the lock flag are used; every earlier
+// stage (S0..S7) is left unconnected on purpose.
 rds u_rds (
-    .clk        (clk),
-    .rstb       (rstb),
-    .i_mpx_data (rds_mix_i),
-    .strb       (pll_valid_d1),
-    .o_rds_data (rds_data),
-    .valid      (rds_valid)
+    .clk           (clk),
+    .rstb          (rstb),
+    .i_mpx_data    (rds_mix_i),
+    .strb          (pll_valid_d1),
+    .o_rds_data    (),
+    .valid         (),
+    .o_lpf_data    (),
+    .o_lpf_valid   (),
+    .o_nco_phase   (),
+    .o_nco_valid   (),
+    .o_soft        (),
+    .o_biphase     (),
+    .o_soft_valid  (),
+    .o_data_bit    (),
+    .o_data_valid  (),
+    .o_syndrome    (),
+    .o_offset_type (),
+    .o_syn_valid   (),
+    .o_block_data  (),
+    .o_block_type  (),
+    .o_block_valid (),
+    .o_locked      (rds_locked),
+    .o_pi          (rds_pi),
+    .o_ps          (rds_ps),
+    .o_rt          (rds_rt)
 );
 
+// ---- Decoded RDS over debug slot 3 (ch1_i), one 16-bit word per o_valid ----
+// Each word is {1'b0, addr[6:0], byte[7:0]}: a free-running scan of the decoded
+// registers, so the PC needs no framing -- every word says where it belongs and
+// a lost word is just refreshed on the next sweep (75 words = 1.56ms @ 48kHz).
+//   addr 0..1   PI (high, low)            addr 2..9   PS chars 0..7
+//   addr 10..73 RadioText chars 0..63     addr 74     status (bit0 = lock)
+// Matched by tools/pc_console.py (RDS_ADDR_* constants).
+localparam logic [6:0] RDS_LAST_ADDR = 7'd74;
+
+logic  [6:0] rds_scan_addr;
+logic  [6:0] rds_ps_idx, rds_rt_idx;
+logic  [7:0] rds_scan_byte;
+logic [15:0] rds_dbg_word;
+
+assign rds_ps_idx = rds_scan_addr - 7'd2;
+assign rds_rt_idx = rds_scan_addr - 7'd10;
+
+always_comb begin : RDS_SCAN_MUX
+    if      (rds_scan_addr == 7'd0)  rds_scan_byte = rds_pi[15:8];
+    else if (rds_scan_addr == 7'd1)  rds_scan_byte = rds_pi[7:0];
+    else if (rds_scan_addr <  7'd10) rds_scan_byte = rds_ps[63  - 8*rds_ps_idx -: 8];
+    else if (rds_scan_addr <  7'd74) rds_scan_byte = rds_rt[511 - 8*rds_rt_idx -: 8];
+    else                             rds_scan_byte = {7'b0, rds_locked};
+end
+
+always_ff @(posedge clk) begin : RDS_SCAN
+    if(~rstb) begin
+        rds_scan_addr <= '0;
+        rds_dbg_word  <= '0;
+    end else if(mpx_demod_valid) begin
+        rds_dbg_word  <= {1'b0, rds_scan_addr, rds_scan_byte};
+        rds_scan_addr <= (rds_scan_addr == RDS_LAST_ADDR) ? 7'd0 : rds_scan_addr + 7'd1;
+    end
+end
+
 assign o_valid = mpx_demod_valid;
-assign debug   = {mpx_demod_audio_r, mpx_demod_audio_l, rds_data, pll_vco1_sin};
+assign debug   = {mpx_demod_audio_r, mpx_demod_audio_l, rds_dbg_word, pll_vco1_sin};
 
 endmodule

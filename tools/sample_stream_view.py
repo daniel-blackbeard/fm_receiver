@@ -107,9 +107,8 @@ class SampleReceiver:
     def set_audio_queue(self, q):
         """q: a queue.Queue (or None to disable) that will receive each
         packet's raw stereo audio samples (unsigned, shape (N,2)) as they
-        arrive. Currently both channels carry mono (ch0_i) -- ster
-        (ch0_q) is muted while the PLL lock issue is being diagnosed, see
-        _run()'s stereo= line. Safe to call at any time, whether or not
+        arrive as [L, R] = [ch0_q, ch0_i] (real stereo, see _run()'s
+        stereo= line). Safe to call at any time, whether or not
         the receiver thread is currently running."""
         with self.lock:
             self.audio_queue = q
@@ -153,14 +152,13 @@ class SampleReceiver:
                 self.bytes_received += len(data)
                 if self.audio_queue is not None:
                     try:
-                        # Ster (ch0_q) muted 2026-09-18: PLL isn't locking
-                        # (frequency steadily drifting), which puts a slow
-                        # beat tone into ster since it's downconverted
-                        # against the drifting VCO -- mono (ch0_i) doesn't
-                        # go through that mixer at all, so it's unaffected.
-                        # Both channels play mono until the PLL lock issue
-                        # is fixed; revert to [ch0_q, ch0_i] afterward.
-                        stereo = np.stack([ch0_i, ch0_i], axis=-1).astype(np.int64)
+                        # Real stereo again (2026-09-21): [L, R] = [ch0_q,
+                        # ch0_i] (dsp.sv's audio_l / audio_r). It was muted
+                        # to mono (ch0_i on both sides) on 2026-09-18 while
+                        # the PLL wasn't locking and a drifting-VCO beat
+                        # leaked into the stereo difference channel; the PLL
+                        # has locked on real hardware since.
+                        stereo = np.stack([ch0_q, ch0_i], axis=-1).astype(np.int64)
                         self.audio_queue.put_nowait(stereo)
                     except queue.Full:
                         # Audio consumer fell behind -- drop this chunk
